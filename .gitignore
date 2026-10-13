@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+dist/
+xbox-debug.log
+*.png
+
+# local / personal
+CLAUDE.md
+.claude/
+.mcp.json
+*.log
+*.raw

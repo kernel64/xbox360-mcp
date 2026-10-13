@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "xbox360": {
+      "command": "uv",
+      "args": ["--directory", "C:\\chemin\\vers\\xbox360-mcp", "run", "xbox360-mcp"],
+      "env": {
+        "XBOX360_HOST": "192.168.1.50",
+        "XBOX360_DEPLOY_ROOT": "Hdd:\\Devkit",
+        "XBOX360_LOG_FILE": "C:\\chemin\\vers\\xbox-debug.log"
+      }
+    }
+  }
+}
