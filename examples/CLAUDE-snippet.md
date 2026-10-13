@@ -1,18 +1,18 @@
-## Xbox 360 (serveur MCP `xbox360`)
+## Xbox 360 (`xbox360` MCP server)
 
-La console RGH est accessible via les outils `xbox_*`.
+The RGH console is reachable through the `xbox_*` tools.
 
-- Sortie de build : `build\Release\` (contient `default.xex`)  <!-- adapter -->
-- Dossier console : `Hdd:\Devkit\Harissa64`                       <!-- adapter -->
-- Log affiché quand l'init est OK : `init ok`                    <!-- adapter : regex -->
+- Build output: `build\Release\` (contains `default.xex`)   <!-- adjust -->
+- Console folder: `Hdd:\Devkit\MyGame`                       <!-- adjust -->
+- Log line printed when init is OK: `init ok`                <!-- adjust: regex -->
 
-Boucle de test après chaque modification :
-1. Compiler.
-2. `xbox_deploy(local_dir=<sortie>, remote_dir=<dossier console>, launch=true, wait_for=<log init>)`.
-3. Lire la suite avec `xbox_debug_log(since_id=<next_since_id précédent>)`.
-4. Si `timed_out` ou ligne `[exception]` : `xbox_crash_report`, analyser PC/LR/backtrace vs le code source
-   (module `default.xex`, base 0x82000000 en général ; utiliser le .map/.pdb du build pour retrouver la fonction).
-5. `xbox_screenshot` pour vérifier le rendu.
-6. Après un crash : `xbox_reboot` avant de relancer.
+Test loop after each change:
+1. Build.
+2. `xbox_deploy(local_dir=<output>, remote_dir=<console folder>, launch=true, wait_for=<init log>)`.
+3. Read what follows with `xbox_debug_log(since_id=<previous next_since_id>)`.
+4. On `timed_out` or an `[exception]` line: `xbox_crash_report`, then match PC/LR/backtrace against the
+   source (module `default.xex`, usually based at 0x82000000; use the build's .map/.pdb to find the function).
+5. `xbox_screenshot` to check the rendering.
+6. After a crash: `xbox_reboot` before launching again.
 
-Logger avec `OutputDebugStringA` / `DbgPrint` côté homebrew : c'est ce que remonte `xbox_debug_log`.
+Log with `OutputDebugStringA` / `DbgPrint` in the homebrew: that's what `xbox_debug_log` picks up.

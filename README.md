@@ -1,43 +1,43 @@
 # xbox360-mcp
 
-J'en avais marre de faire des allers-retours entre le PC et la Xbox à chaque modif d'un homebrew :
-copier le xex en FTP, le lancer depuis Aurora, regarder la télé, deviner pourquoi ça plante...
-Du coup j'ai écrit ce petit outil qui parle directement à xbdm (le debug monitor de la 360, port 730)
-et qui s'utilise de trois façons :
+I got tired of bouncing between my PC and the Xbox every time I changed something in a homebrew:
+copy the xex over FTP, launch it from Aurora, stare at the TV, guess why it crashed...
+So I wrote this small tool that talks directly to xbdm (the 360 debug monitor, port 730).
+You can use it three ways:
 
-- comme serveur MCP, pour que Claude Code puisse déployer, lancer, lire les logs, faire des
-  screenshots et analyser les crashs tout seul ;
-- en ligne de commande (`xbox360 ...`), pour les scripts de build ;
-- comme petite librairie Python.
+- as an MCP server, so Claude Code can deploy, launch, read the logs, take screenshots and dig
+  into crashes on its own;
+- from the command line (`xbox360 ...`), for build scripts;
+- as a small Python library.
 
-Ça marche sur une console RGH/JTAG avec xbdm chargé. Je l'utilise sur une Jtag Trinity
+It works on an RGH/JTAG console with xbdm loaded. I use it on a Jtag Trinity
 (kernel 17559, Aurora 0.7b).
 
-## Côté console
+## Console side
 
-Il faut que `xbdm.xex` soit chargé par DashLaunch. Dans `launch.ini` :
+`xbdm.xex` has to be loaded by DashLaunch. In `launch.ini`:
 
 ```ini
 [Plugins]
 plugin1 = Hdd:\xbdm.xex
-plugin2 = Hdd:\JRPC2.xex   ; facultatif
+plugin2 = Hdd:\JRPC2.xex   ; optional
 ```
 
-JRPC2 n'est pas obligatoire, il sert juste pour les températures, le title ID et les
-notifications à l'écran (XNotify). Sans lui, tout le reste fonctionne.
+JRPC2 isn't required, it's only used for temperatures, the title ID and on-screen notifications
+(XNotify). Everything else works without it.
 
-La console et le PC doivent être sur le même réseau. Pour vérifier que xbdm répond :
+The console and the PC need to be on the same network. To check that xbdm is answering:
 
 ```powershell
 Test-NetConnection 192.168.1.50 -Port 730
 ```
 
-(remplace l'IP par celle de ta console, Aurora l'affiche en bas de l'écran). Toutes les connexions
-partent du PC, donc pas besoin d'ouvrir quoi que ce soit dans le pare-feu.
+(use your console's IP, Aurora shows it at the bottom of the screen). Every connection is opened
+from the PC, so there's nothing to open in the firewall.
 
-## Installation
+## Install
 
-J'utilise [uv](https://docs.astral.sh/uv/) :
+I use [uv](https://docs.astral.sh/uv/):
 
 ```powershell
 git clone https://github.com/kernel64/xbox360-mcp
@@ -47,69 +47,68 @@ $env:XBOX360_HOST = "192.168.1.50"
 uv run xbox360 info
 ```
 
-Si `info` te renvoie le nom de la console et le titre en cours, c'est bon.
-Sans uv, un `pip install -e .` dans un venv fait l'affaire.
+If `info` prints the console name and the running title, you're good.
+Without uv, `pip install -e .` in a venv does the job.
 
-## Avec Claude Code
+## With Claude Code
 
 ```powershell
-claude mcp add xbox360 --scope user -e XBOX360_HOST=192.168.1.50 -- uv --directory C:\chemin\vers\xbox360-mcp run xbox360-mcp
+claude mcp add xbox360 --scope user -e XBOX360_HOST=192.168.1.50 -- uv --directory C:\path\to\xbox360-mcp run xbox360-mcp
 ```
 
-Tu peux aussi le déclarer par projet avec un `.mcp.json` (il y a un modèle dans
-`examples/mcp.example.json`). Ensuite `/mcp` dans Claude Code doit afficher `xbox360` connecté.
+You can also declare it per project with a `.mcp.json` (there's a template in
+`examples/mcp.example.json`). After that, `/mcp` in Claude Code should show `xbox360` as connected.
 
-Dans `examples/CLAUDE-snippet.md` il y a un bout de texte à coller dans le `CLAUDE.md` de ton
-projet homebrew : il explique à Claude quel dossier déployer et quel message de log attendre au
-démarrage. Avec ça, tu peux lui demander des choses comme « compile en Release, déploie, lance, attends
-`init ok` et si ça plante montre-moi le crash report », et il se débrouille.
+`examples/CLAUDE-snippet.md` is a piece of text to paste into your homebrew project's `CLAUDE.md`:
+it tells Claude which folder to deploy and which log line to wait for at startup. With that, you can
+ask things like "build in Release, deploy, launch, wait for `init ok` and if it crashes show me the
+crash report", and it figures it out.
 
-Ce qu'il a à disposition :
+What it has to work with:
 
-- **console** : état, lecteurs, reboot, notification à l'écran, commande xbdm brute ;
-- **fichiers** : lister, télécharger, lire un fichier texte, envoyer, créer, renommer, supprimer ;
-- **dev** : `xbox_deploy` envoie seulement les fichiers modifiés, puis peut lancer le xex et attendre
-  une ligne de log précise ; `xbox_launch` lance un xex déjà présent ;
-- **logs** : tout ce que le titre envoie via `OutputDebugString`/`DbgPrint`, plus les exceptions,
-  chargements de modules, etc., capturés en continu en arrière-plan ;
-- **écran** : screenshot du framebuffer, renvoyé directement en image ;
-- **debug** : crash report (threads arrêtés, registres, PC/LR résolus en `module+offset`, backtrace,
-  désassemblage), threads, breakpoints, stop/go ;
-- **mémoire** : lecture, écriture, recherche de motifs avec jokers, désassemblage PowerPC (capstone),
-  carte mémoire, modules.
+- **console**: status, drives, reboot, on-screen notification, raw xbdm command;
+- **files**: list, download, read a text file, upload, create, rename, delete;
+- **dev loop**: `xbox_deploy` only sends the files that changed, then can launch the xex and wait for
+  a specific log line; `xbox_launch` starts a xex that's already on the console;
+- **logs**: everything the title sends through `OutputDebugString`/`DbgPrint`, plus exceptions,
+  module loads and so on, captured continuously in the background;
+- **screen**: framebuffer screenshot, returned straight as an image;
+- **debug**: crash report (stopped threads, registers, PC/LR resolved as `module+offset`, backtrace,
+  disassembly), threads, breakpoints, stop/go;
+- **memory**: read, write, pattern search with wildcards, PowerPC disassembly (capstone),
+  memory map, modules.
 
 ## Configuration
 
-Tout passe par des variables d'environnement :
+Everything goes through environment variables:
 
-| Variable | Défaut | |
+| Variable | Default | |
 |---|---|---|
-| `XBOX360_HOST` | | IP de la console (obligatoire) |
+| `XBOX360_HOST` | | console IP (required) |
 | `XBOX360_PORT` | `730` | |
-| `XBOX360_TIMEOUT` | `10` | en secondes |
-| `XBOX360_DEPLOY_ROOT` | `Hdd:\Devkit` | où `xbox_deploy` envoie les builds par défaut |
-| `XBOX360_LOG_FILE` | | si défini, tous les logs sont aussi écrits dans ce fichier |
-| `XBOX360_READ_ONLY` | `0` | voir plus bas |
-| `XBOX360_ATTACH_DEBUGGER` | `1` | voir plus bas |
+| `XBOX360_TIMEOUT` | `10` | in seconds |
+| `XBOX360_DEPLOY_ROOT` | `Hdd:\Devkit` | where `xbox_deploy` puts builds by default |
+| `XBOX360_LOG_FILE` | | if set, every log line is also written to this file |
+| `XBOX360_READ_ONLY` | `0` | see below |
+| `XBOX360_ATTACH_DEBUGGER` | `1` | see below |
 
-**Mode lecture seule.** Avec `XBOX360_READ_ONLY=1`, rien ne peut être écrit, supprimé, lancé ou
-redémarré, et la commande brute n'accepte que des commandes de lecture connues. Je conseille de
-commencer comme ça pour tester.
+**Read-only mode.** With `XBOX360_READ_ONLY=1`, nothing can be written, deleted, launched or
+rebooted, and the raw command only accepts known read commands. I'd start like that to try it out.
 
-**Debugger.** Par défaut l'outil s'attache comme debugger. L'intérêt, c'est qu'un crash fige le jeu
-au lieu de revenir au dashboard, et qu'on peut donc aller voir ce qui s'est passé. En lecture seule
-il ne s'attache pas, sauf si tu forces `XBOX360_ATTACH_DEBUGGER=1`.
+**Debugger.** By default the tool attaches as a debugger. The point is that a crash freezes the game
+instead of dropping back to the dashboard, so you can actually go look at what happened. In read-only
+mode it doesn't attach, unless you force `XBOX360_ATTACH_DEBUGGER=1`.
 
-**Dossiers protégés.** Même hors lecture seule, la suppression et le renommage refusent les racines
-des lecteurs, `Flash:`, `Hdd:\Content` (profils, DLC, mises à jour) et `Hdd:\Cache`. Si tu sais ce
-que tu fais, la CLI a un `rm --force`.
+**Protected folders.** Even outside read-only mode, delete and rename refuse drive roots, `Flash:`,
+`Hdd:\Content` (profiles, DLC, title updates) and `Hdd:\Cache`. If you know what you're doing, the
+CLI has `rm --force`.
 
-## En ligne de commande
+## Command line
 
 ```powershell
 uv run xbox360 info
 uv run xbox360 ls Hdd:\Apps
-uv run xbox360 deploy .\build\Release Hdd:\Devkit\MonJeu --run --wait "init ok"
+uv run xbox360 deploy .\build\Release Hdd:\Devkit\MyGame --run --wait "init ok"
 uv run xbox360 log -f
 uv run xbox360 screenshot capture.png
 uv run xbox360 mem 82000000 100 --format u32
@@ -118,11 +117,11 @@ uv run xbox360 crash
 uv run xbox360 raw dmversion
 ```
 
-Pour `mem`, l'adresse et la longueur sont en hexa (`100` = 256 octets). `deploy --prune` supprime
-aussi sur la console les fichiers que tu as retirés en local. Attention, ça inclut ce que le jeu a pu
-écrire lui-même dans ce dossier (sauvegardes, configs).
+For `mem`, both the address and the length are hex (`100` = 256 bytes). `deploy --prune` also
+deletes files on the console that you removed locally. Careful: that includes anything the game
+wrote into that folder itself (saves, configs).
 
-## En Python
+## Python
 
 ```python
 from xbox360_mcp import XboxConsole
@@ -130,30 +129,30 @@ from xbox360_mcp import XboxConsole
 x = XboxConsole("192.168.1.50")
 print(x.info())
 x.upload_file("Hdd:\\Devkit\\test.bin", "test.bin")
-data, illisible = x.read_memory(0x82000000, 0x100)
+data, unreadable = x.read_memory(0x82000000, 0x100)
 ```
 
 ## Tests
 
-`tests/mock_xbdm.py` est une fausse console qui imite xbdm (fichiers, mémoire, threads, logs,
-screenshot, JRPC2). Les tests tournent contre elle :
+`tests/mock_xbdm.py` is a fake console that mimics xbdm (files, memory, threads, logs, screenshot,
+JRPC2). The tests run against it:
 
 ```powershell
 uv run --extra dev pytest
 ```
 
-Tu peux aussi la lancer à part (`python tests/mock_xbdm.py --port 7300`) et pointer l'outil dessus
-avec `XBOX360_HOST=127.0.0.1` et `XBOX360_PORT=7300` pour essayer sans Xbox.
+You can also run it on its own (`python tests/mock_xbdm.py --port 7300`) and point the tool at it
+with `XBOX360_HOST=127.0.0.1` and `XBOX360_PORT=7300` to play around without an Xbox.
 
-## Quelques remarques
+## A few notes
 
-- Les screenshots sont en BGRA sur une vraie console. Si un jour les couleurs sont bizarres,
-  l'option `channel_order` (ou `--order` en CLI) permet d'essayer un autre ordre.
-- Sans JRPC2, xbdm répond `DEBUGGING` à toutes les commandes `consolefeatures`. L'outil le détecte et
-  considère simplement que le plugin n'est pas là.
-- xbdm n'accepte que 4 connexions à peu près en même temps. Si tu as une erreur `401`, ferme les
-  autres outils (Neighborhood, etc.).
-- Pas encore de breakpoints mémoire ni de pas-à-pas dédiés. En attendant, ça passe par la commande
-  brute (`break read=0x... size=4`, `step`...).
-- Le format de certaines réponses (`getcontext` notamment) peut varier selon la version de xbdm. Si
-  quelque chose manque, la commande brute montre la réponse telle quelle.
+- Screenshots are BGRA on a real console. If colors ever look off, `channel_order` (or `--order` on
+  the CLI) lets you try another byte order.
+- Without JRPC2, xbdm answers `DEBUGGING` to every `consolefeatures` command. The tool detects that
+  and just treats the plugin as missing.
+- xbdm only takes about 4 connections at once. If you get a `401` error, close the other tools
+  (Neighborhood, etc.).
+- No memory breakpoints or dedicated single-stepping yet. For now that goes through the raw command
+  (`break read=0x... size=4`, `step`...).
+- Some replies (`getcontext` in particular) can vary between xbdm versions. If something's missing,
+  the raw command shows the reply as-is.
