@@ -5,9 +5,10 @@ Run:  XBOX360_HOST=192.168.1.50 xbox360-mcp
 
 from __future__ import annotations
 
+import atexit
 import functools
 import os
-
+import sys
 import time
 from pathlib import Path
 from typing import Literal
@@ -21,6 +22,7 @@ from . import analysis, deploy as deploy_mod, jrpc, ppc
 from .client import XboxConsole
 from .config import Config
 from .framebuffer import to_png
+from .lock import ConsoleBusy, ConsoleLock, describe as describe_lock
 from .notify import NotificationListener
 from .protocol import XbdmConnectionError, XbdmError, is_read_only_command, normalize_path
 
@@ -40,11 +42,22 @@ Console paths look like `Hdd:\\Apps\\MyGame\\default.xex` (forward slashes accep
 Local paths are on the PC running this server; prefer absolute paths.
 Memory addresses are hex strings (`0x82000000`) or ints. Titles usually load at 0x82000000.
 `xbox_raw_command` sends any XBDM command when no dedicated tool exists.
+
+The console may be shared with other Claude Code sessions. Tools that change it (deploy, launch,
+reboot, upload, write memory, breakpoints...) reserve it automatically when it is free. Before a
+multi-step test, call `xbox_lock(reason=...)` so nobody launches something else in the middle;
+call `xbox_unlock` when you are done. If another session holds it you get a "Console reserved by"
+error: either wait with `xbox_lock(wait_seconds=...)` or do other work and retry later.
+Never work around a reservation (e.g. with xbox_raw_command).
 """
 
 cfg = Config.from_env()
 xbox = XboxConsole(cfg.host, cfg.port, cfg.timeout)
 notifier = NotificationListener(cfg.host, cfg.port, attach_debugger=cfg.attach_debugger, log_file=cfg.log_file)
+console_lock = ConsoleLock(cfg.host, lease_seconds=cfg.lock_lease)
+atexit.register(lambda: console_lock.release())
+
+LOCK_HINT = "Wait for it with xbox_lock(wait_seconds=...) or do something else and retry later."
 
 mcp = _Server("xbox360", instructions=INSTRUCTIONS)
 
@@ -62,8 +75,20 @@ def _addr(v: str | int) -> int:
 
 
 def _guard_write() -> None:
+    """Call at the start of every tool that changes the console: read-only check, then reserve
+    the console for this session (fails if another session holds it)."""
     if cfg.read_only:
         raise PermissionError("Server is in read-only mode (XBOX360_READ_ONLY=1).")
+    tool = sys._getframe(1).f_code.co_name
+    try:
+        console_lock.claim(f"auto: {tool}")
+    except ConsoleBusy as e:
+        raise ConsoleBusy(e.info, LOCK_HINT) from None
+
+
+def _lock_info() -> dict | str:
+    st = console_lock.status()
+    return st if st else "free"
 
 
 def _local(path: str) -> Path:
@@ -75,6 +100,7 @@ def friendly(fn):
 
     @functools.wraps(fn)
     def wrapper(*a, **kw):
+        console_lock.renew()  # any call from the holder keeps its reservation alive
         try:
             return fn(*a, **kw)
         except XbdmConnectionError as e:
@@ -96,11 +122,13 @@ def _ensure_notifier() -> None:
 @mcp.tool(annotations=RO)
 @friendly
 def xbox_status(include_temperatures: bool = True) -> dict:
-    """Console name, type, kernel/system info, running title, debug-log channel state,
-    and (if the JRPC2 plugin is loaded) temperatures, title ID and kernel version."""
-    _ensure_notifier()
+    """Console name, type, kernel/system info, running title, who has the console reserved,
+    debug-log channel state, and (if the JRPC2 plugin is loaded) temperatures, title ID and
+    kernel version."""
     info = xbox.info()
+    info["reservation"] = _lock_info()
     info["debug_channel"] = {
+        "running": notifier.running,
         "connected": notifier.connected,
         "events_buffered_until_id": notifier.next_id - 1,
         "last_error": notifier.last_error,
@@ -253,6 +281,9 @@ def xbox_delete(path: str, recursive: bool = False) -> str:
 # ---------------------------------------------------------------------------
 def _launch_and_watch(xex: str, wait_for: str | None, timeout: float, capture_seconds: float) -> dict:
     _ensure_notifier()
+    deadline = time.time() + 3  # don't miss the first lines if the channel was just opened
+    while not notifier.connected and time.time() < deadline:
+        time.sleep(0.05)
     start_id = notifier.next_id - 1
     xbox.launch(xex)
     out: dict = {"launched": normalize_path(xex), "log_since_id": start_id}
@@ -355,11 +386,15 @@ def xbox_debug_log(
     modload, mcp, ..."""
     _ensure_notifier()
     evs = notifier.query(since_id=since_id, limit=limit, contains=contains, regex=regex, types=types)
-    return {
+    out = {
         "channel_connected": notifier.connected,
         "lines": [f"#{e.id} {e.to_dict()['time']} [{e.type}] {e.text}" for e in evs],
         "next_since_id": notifier.next_id - 1,
     }
+    st = console_lock.status()
+    if st and not st["held_by_me"]:  # these lines may come from someone else's test
+        out["note"] = describe_lock(st)
+    return out
 
 
 @mcp.tool(annotations=RO)
@@ -575,14 +610,52 @@ def xbox_notify(message: str) -> str:
 def xbox_raw_command(command: str) -> dict:
     """Send any raw XBDM command line (e.g. 'systime', 'getconsoleid', 'xbeinfo running',
     'modsections name="default.xex"'). Returns status code, message and multiline body.
-    In read-only mode only known read commands are accepted."""
-    if cfg.read_only and not is_read_only_command(command):
-        raise PermissionError(f"read-only mode: '{command.split(' ', 1)[0]}' is not a known read-only XBDM command")
+    In read-only mode only known read commands are accepted; any other command reserves the console."""
+    if not is_read_only_command(command):
+        if cfg.read_only:
+            raise PermissionError(f"read-only mode: '{command.split(' ', 1)[0]}' is not a known read-only XBDM command")
+        _guard_write()
     return xbox.raw(command)
 
 
+# ---------------------------------------------------------------------------
+# Sharing the console between sessions
+# ---------------------------------------------------------------------------
+@mcp.tool(annotations=WRITE)
+def xbox_lock(reason: str, wait_seconds: float = 0, owner: str | None = None) -> dict:
+    """Reserve the console for a test session so other Claude Code sessions (and build scripts
+    using the CLI) can't deploy / launch / reboot in the middle of it. If someone else holds it,
+    waits up to wait_seconds (max 1800) for them to finish, otherwise fails with who holds it.
+    owner = name shown to the others (e.g. your project name). The reservation is renewed by each of
+    your tool calls and expires after XBOX360_LOCK_LEASE seconds (default 600) without any.
+    Also opens the debug-log channel. Release it with xbox_unlock when done."""
+    if owner:
+        console_lock.owner = owner
+    try:
+        info = console_lock.acquire(reason, wait_seconds=max(0.0, min(wait_seconds, 1800.0)))
+    except ConsoleBusy as e:
+        raise ConsoleBusy(e.info, LOCK_HINT) from None
+    _ensure_notifier()
+    return info
+
+
+@mcp.tool(annotations=WRITE)
+def xbox_unlock() -> str:
+    """Release your reservation of the console so other sessions can use it."""
+    if not console_lock.release():
+        st = console_lock.status()
+        return "you did not hold the console" + (f"; {describe_lock(st)}" if st else " (it is free)")
+    notifier.stop()  # frees an xbdm connection (xbdm accepts only ~4)
+    return "console released"
+
+
+@mcp.tool(annotations=RO)
+def xbox_lock_status() -> dict | str:
+    """Who has the console reserved (owner, reason, for how long, lease left), or "free"."""
+    return _lock_info()
+
+
 def main() -> None:
-    notifier.start()
     mcp.run()
 
 

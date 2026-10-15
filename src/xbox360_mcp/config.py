@@ -22,6 +22,7 @@ class Config:
     attach_debugger: bool = True
     log_file: str | None = None
     default_deploy_root: str = "Hdd:\\Devkit"
+    lock_lease: float = 600.0
 
     @classmethod
     def from_env(cls, host: str | None = None) -> "Config":
@@ -40,4 +41,5 @@ class Config:
             attach_debugger=_bool("XBOX360_ATTACH_DEBUGGER", not read_only),
             log_file=os.environ.get("XBOX360_LOG_FILE") or None,
             default_deploy_root=os.environ.get("XBOX360_DEPLOY_ROOT", "Hdd:\\Devkit"),
+            lock_lease=float(os.environ.get("XBOX360_LOCK_LEASE", "600")),
         )

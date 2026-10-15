@@ -91,6 +91,8 @@ Everything goes through environment variables:
 | `XBOX360_LOG_FILE` | | if set, every log line is also written to this file |
 | `XBOX360_READ_ONLY` | `0` | see below |
 | `XBOX360_ATTACH_DEBUGGER` | `1` | see below |
+| `XBOX360_LOCK_LEASE` | `600` | how long a reservation lasts without activity, in seconds (see below) |
+| `XBOX360_OWNER` | project folder | name other sessions see when you hold the console |
 
 **Read-only mode.** With `XBOX360_READ_ONLY=1`, nothing can be written, deleted, launched or
 rebooted, and the raw command only accepts known read commands. I'd start like that to try it out.
@@ -102,6 +104,29 @@ mode it doesn't attach, unless you force `XBOX360_ATTACH_DEBUGGER=1`.
 **Protected folders.** Even outside read-only mode, delete and rename refuse drive roots, `Flash:`,
 `Hdd:\Content` (profiles, DLC, title updates) and `Hdd:\Cache`. If you know what you're doing, the
 CLI has `rm --force`.
+
+## Several sessions, one console
+
+I often have two or three Claude Code windows open on different homebrews, and they all want the
+Xbox at some point. Without some coordination, one of them launches its xex right in the middle of
+the other one's test, and then both get confused by logs and screenshots that aren't theirs.
+
+So the console can be reserved. Anything that changes it (deploy, launch, reboot, upload, memory
+writes, breakpoints...) reserves it automatically if it's free. For a test that takes several steps,
+Claude calls `xbox_lock` first with a short reason, and `xbox_unlock` when it's done. If another
+session holds the console, the tool fails with a message saying who has it, why and for how long, and
+Claude can either wait in line (`xbox_lock(wait_seconds=...)`) or go do something else. Reads
+(listing files, memory, status...) are always allowed.
+
+The reservation lives in a small file under `~/.xbox360-mcp/locks/`, so it works across every session
+and the CLI on the same PC. It renews itself with each tool call from the holder and goes away on its
+own after `XBOX360_LOCK_LEASE` seconds of inactivity, or as soon as the holder's process is gone (when
+you close that Claude Code window, for instance). If one ever gets stuck anyway,
+`xbox360 unlock --force` clears it.
+
+The CLI follows the same rules: write commands take the reservation for as long as they run, and
+`--wait-lock 300` makes them wait their turn instead of failing. `xbox360 lock-status` tells you who
+has the console.
 
 ## Command line
 

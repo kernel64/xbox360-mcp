@@ -18,8 +18,11 @@ from pathlib import Path
 from . import analysis, deploy as deploy_mod, jrpc
 from .client import XboxConsole
 from .framebuffer import to_png
+from .lock import ConsoleBusy, ConsoleLock, describe as describe_lock
 from .notify import NotificationListener
-from .protocol import XbdmConnectionError, XbdmError, normalize_path
+from .protocol import XbdmConnectionError, XbdmError, is_read_only_command, normalize_path
+
+WRITE_COMMANDS = {"put", "rm", "mkdir", "deploy", "run", "reboot", "notify"}
 
 
 def _hex(s: str) -> int:
@@ -38,7 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="xbox360", description="Xbox 360 RGH (xbdm) toolbox")
     p.add_argument("--host", default=os.environ.get("XBOX360_HOST") or os.environ.get("XBOX_IP"))
     p.add_argument("--port", type=int, default=int(os.environ.get("XBOX360_PORT", "730")))
+    p.add_argument(
+        "--wait-lock", type=float, default=0, metavar="SECONDS",
+        help="if another session has the console reserved, wait up to SECONDS for it (default: fail at once)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("lock-status", help="who has the console reserved")
+    s = sub.add_parser("unlock", help="clear a stuck reservation held by another session")
+    s.add_argument("--force", action="store_true", required=True)
 
     sub.add_parser("info", help="console info")
     sub.add_parser("drives", help="drives and free space")
@@ -100,13 +110,30 @@ def main(argv: list[str] | None = None) -> int:
     if not args.host:
         print("Set --host or XBOX360_HOST", file=sys.stderr)
         return 2
+    lock = ConsoleLock(args.host, owner=os.environ.get("XBOX360_OWNER") or f"xbox360 CLI in {Path.cwd().name}")
+    if args.cmd == "lock-status":
+        st = lock.status()
+        print(describe_lock(st) if st else "free")
+        return 0
+    if args.cmd == "unlock":
+        print("reservation cleared" if lock.release(force=True) else "nothing to clear")
+        return 0
+    # commands that change the console reserve it for their duration, like the MCP tools do
+    needs_lock = args.cmd in WRITE_COMMANDS or (args.cmd == "raw" and not is_read_only_command(" ".join(args.command)))
     x = XboxConsole(args.host, args.port)
     try:
+        if needs_lock:
+            lock.acquire(f"xbox360 {args.cmd}", wait_seconds=args.wait_lock)
         return _dispatch(x, args)
+    except ConsoleBusy as e:
+        print(f"error: {e} Retry later or pass --wait-lock SECONDS.", file=sys.stderr)
+        return 4
     except (XbdmError, XbdmConnectionError, FileNotFoundError, PermissionError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     finally:
+        if needs_lock:
+            lock.release()
         x.close()
 
 

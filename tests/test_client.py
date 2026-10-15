@@ -6,7 +6,7 @@ import pytest
 from PIL import Image
 
 import mock_xbdm
-from xbox360_mcp import analysis, deploy, jrpc
+from xbox360_mcp import ConsoleBusy, ConsoleLock, analysis, deploy, jrpc
 from xbox360_mcp.client import XboxConsole
 from xbox360_mcp.framebuffer import to_png
 from xbox360_mcp.notify import NotificationListener, parse_notification
@@ -191,9 +191,10 @@ def test_deploy_launch_and_logs(xbox, tmp_path, port, monkeypatch):
 
 
 @pytest.fixture
-def server(port, monkeypatch):
+def server(port, monkeypatch, tmp_path):
     import importlib
 
+    monkeypatch.setenv("XBOX360_CACHE_DIR", str(tmp_path / "cache"))  # isolated lock files
     monkeypatch.setenv("XBOX360_HOST", "127.0.0.1")
     monkeypatch.setenv("XBOX360_PORT", str(port))
     srv = importlib.import_module("xbox360_mcp.server")
@@ -219,3 +220,98 @@ def test_server_delete_protection(server):
     with pytest.raises(PermissionError):
         server.xbox_delete("Hdd:/")
     assert server.xbox.exists("Hdd:/Content/0000000000000000/profile")
+
+
+# ---------------------------------------------------------------------------
+# Console reservation shared between sessions
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def lock_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("XBOX360_CACHE_DIR", str(tmp_path / "cache"))
+    return tmp_path / "cache" / "locks"
+
+
+def test_lock_exclusive_and_wait(lock_dir):
+    import threading
+
+    a = ConsoleLock("10.0.0.5", owner="Harissa64")
+    b = ConsoleLock("10.0.0.5", owner="OtherGame")
+    assert a.status() is None
+    assert a.acquire("RSP test")["held_by_me"]
+    with pytest.raises(ConsoleBusy) as e:
+        b.acquire("my test")
+    assert "Harissa64" in str(e.value) and "RSP test" in str(e.value)
+    assert b.status()["owner"] == "Harissa64" and not b.status()["held_by_me"]
+    assert a.claim("auto: xbox_launch")["reason"] == "RSP test"  # keeps the explicit reason
+    assert a.renew() and not b.renew()
+    assert not b.release()  # can't release someone else's reservation
+    threading.Timer(0.3, a.release).start()
+    got = b.acquire("my test", wait_seconds=5, poll=0.05)
+    assert got["owner"] == "OtherGame" and got["held_by_me"]
+    assert ConsoleLock("10.0.0.6").status() is None  # one reservation per console
+    assert b.release(force=False) and b.status() is None
+
+
+def test_lock_expires_and_survives_dead_holder(lock_dir):
+    import json
+    import socket
+    import subprocess
+    import sys
+
+    a = ConsoleLock("10.0.0.5", owner="A", lease_seconds=0.2)
+    b = ConsoleLock("10.0.0.5", owner="B")
+    a.acquire("short")
+    with pytest.raises(ConsoleBusy):
+        b.acquire()
+    time.sleep(0.3)
+    assert b.acquire("after expiry")["owner"] == "B"
+    b.release()
+
+    # holder process is gone (e.g. its Claude Code window was closed): reservation is free
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    b.path.write_text(json.dumps({
+        "token": "dead", "owner": "ghost", "reason": "", "pid": proc.pid,
+        "machine": socket.gethostname(), "acquired_at": time.time(), "expires_at": time.time() + 600,
+    }), "utf-8")
+    assert b.status() is None
+    assert b.acquire("ghost gone")["owner"] == "B"
+
+
+def test_server_respects_other_session(server):
+    other = ConsoleLock("127.0.0.1", owner="other session")
+    other.acquire("their test")
+    with pytest.raises(ConsoleBusy) as e:
+        server.xbox_mkdir("Hdd:/Devkit/locktest")
+    assert "other session" in str(e.value) and "xbox_lock" in str(e.value)
+    with pytest.raises(ConsoleBusy):
+        server.xbox_raw_command("magicboot")
+    assert server.xbox_raw_command("dbgname")["message"] == "MockXenon"  # reads still work
+    assert server.xbox_lock_status()["owner"] == "other session"
+    other.release()
+
+    server.xbox_mkdir("Hdd:/Devkit/locktest")  # auto-reserves the free console
+    st = server.xbox_lock_status()
+    assert st["held_by_me"] and st["reason"] == "auto: xbox_mkdir"
+    assert server.xbox_lock("deploy + RSP test")["reason"] == "deploy + RSP test"
+    with pytest.raises(ConsoleBusy):
+        other.acquire()
+    assert server.xbox_unlock() == "console released"
+    assert server.xbox_lock_status() == "free"
+    server.xbox.delete("Hdd:/Devkit/locktest")
+
+
+def test_cli_lock(port, lock_dir, capsys):
+    from xbox360_mcp import cli
+
+    other = ConsoleLock("127.0.0.1", owner="other session")
+    other.acquire("their test")
+    assert cli.main(["--host", "127.0.0.1", "--port", str(port), "mkdir", "Hdd:/Devkit/clilock"]) == 4
+    assert "other session" in capsys.readouterr().err
+    assert cli.main(["--host", "127.0.0.1", "--port", str(port), "ls", "Hdd:/"]) == 0  # reads allowed
+    assert cli.main(["--host", "127.0.0.1", "lock-status"]) == 0
+    assert "other session" in capsys.readouterr().out
+    assert cli.main(["--host", "127.0.0.1", "unlock", "--force"]) == 0
+    assert cli.main(["--host", "127.0.0.1", "--port", str(port), "mkdir", "Hdd:/Devkit/clilock"]) == 0
+    assert other.status() is None  # the CLI released it when done
+    cli.main(["--host", "127.0.0.1", "--port", str(port), "rm", "Hdd:/Devkit/clilock"])
