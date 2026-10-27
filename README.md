@@ -128,6 +128,39 @@ The CLI follows the same rules: write commands take the reservation for as long 
 `--wait-lock 300` makes them wait their turn instead of failing. `xbox360 lock-status` tells you who
 has the console.
 
+## HDMI capture card
+
+`xbox_screenshot` reads xbdm's framebuffer, which is handy but isn't quite what ends up on the TV. So I
+plugged the console's HDMI into a cheap USB capture card (MS2109 chip, shows up as "USB Video"), and the
+server can use it:
+
+- `xbox_capture_photo`: one frame of the real HDMI output, saved as a full-size PNG;
+- `xbox_capture_burst`: several frames a fixed time apart (or every frame the card delivers, ~30/s),
+  which is what you want for flicker, a glitch that lasts two frames, or checking an animation;
+- `xbox_capture_video`: a clip with sound (MP4, H.264 + AAC);
+- `xbox_capture_record`: start a recording, launch your homebrew, read logs, whatever, then stop.
+
+Claude doesn't get every frame back, just one contact sheet with timestamps on each thumbnail, which
+keeps things light. All the files stay on disk (`~/xbox360-captures` by default) if you want to look
+at them yourself. This doesn't touch the console at all, so it works on any title and doesn't need the
+reservation.
+
+There's nothing to install: ffmpeg comes with the `imageio-ffmpeg` package. The card is detected on its
+own; webcams and virtual cameras (OBS...) are skipped. A capture card can only be used by one program
+at a time, so if OBS or another session has it open you'll get a clear "in use" error. During a
+recording, photos still work (they come from the recording itself).
+
+| Variable | Default | |
+|---|---|---|
+| `XBOX360_CAPTURE_VIDEO` | auto | name of the capture device, if auto-detection picks the wrong one |
+| `XBOX360_CAPTURE_AUDIO` | auto | its audio input, or `none` |
+| `XBOX360_CAPTURE_SIZE` | `1920x1080` | |
+| `XBOX360_CAPTURE_FPS` | `30` | MS2109 cards don't really do more than 30 in 1080p |
+| `XBOX360_CAPTURE_DIR` | `~/xbox360-captures` | where photos, bursts and videos go |
+| `XBOX360_FFMPEG` | bundled | use another ffmpeg |
+
+`xbox360 capture devices` shows what was found. It's Windows only for now (DirectShow).
+
 ## Command line
 
 ```powershell
@@ -140,6 +173,9 @@ uv run xbox360 mem 82000000 100 --format u32
 uv run xbox360 dis 82001234 20
 uv run xbox360 crash
 uv run xbox360 raw dmversion
+uv run xbox360 capture photo
+uv run xbox360 capture burst 12 --interval-ms 100
+uv run xbox360 capture video 30 run.mp4
 ```
 
 For `mem`, both the address and the length are hex (`100` = 256 bytes). `deploy --prune` also

@@ -18,7 +18,7 @@ from typing import Literal
 from mcp.server.mcpserver import Image, MCPServer as _Server
 from mcp.types import ToolAnnotations
 
-from . import analysis, deploy as deploy_mod, jrpc, ppc
+from . import analysis, capture as capture_mod, deploy as deploy_mod, jrpc, ppc
 from .client import XboxConsole
 from .config import Config
 from .framebuffer import to_png
@@ -36,7 +36,12 @@ Typical homebrew / emulator loop:
    from the previous call to only get new lines) or block on `xbox_wait_for_log`.
 3. If the title hangs or crashes: `xbox_crash_report` (stopped threads, registers, PC symbolised
    as module+offset, back-trace, disassembly). Then `xbox_execution go` to resume, or reboot.
-4. `xbox_screenshot` to see the TV output.
+4. `xbox_screenshot` to see the TV output (xbdm framebuffer).
+
+If an HDMI capture card is plugged into the PC, the `xbox_capture_*` tools see exactly what the TV
+shows: `xbox_capture_photo`, `xbox_capture_burst` (frames a few ms apart, for flicker or animations),
+`xbox_capture_video` (a clip with sound) and `xbox_capture_record` (start before launching a title,
+stop after, to review the whole run). They return contact sheets, not every frame; files are kept.
 
 Console paths look like `Hdd:\\Apps\\MyGame\\default.xex` (forward slashes accepted).
 Local paths are on the PC running this server; prefer absolute paths.
@@ -56,6 +61,15 @@ xbox = XboxConsole(cfg.host, cfg.port, cfg.timeout)
 notifier = NotificationListener(cfg.host, cfg.port, attach_debugger=cfg.attach_debugger, log_file=cfg.log_file)
 console_lock = ConsoleLock(cfg.host, lease_seconds=cfg.lock_lease)
 atexit.register(lambda: console_lock.release())
+card = capture_mod.CaptureCard.from_env()
+
+
+def _stop_recording_at_exit() -> None:
+    if card.recording and card.recording.running:
+        card.stop_recording()  # finalise the MP4 instead of leaving ffmpeg running
+
+
+atexit.register(_stop_recording_at_exit)
 
 LOCK_HINT = "Wait for it with xbox_lock(wait_seconds=...) or do something else and retry later."
 
@@ -436,6 +450,84 @@ def xbox_screenshot(
         meta["saved"] = str(p)
     meta["header"] = {k: (hex(v) if isinstance(v, int) else v) for k, v in header.items()}
     return [Image(data=png, format="png"), str(meta)]
+
+
+# ---------------------------------------------------------------------------
+# HDMI capture card (what the TV really shows; doesn't touch the console)
+# ---------------------------------------------------------------------------
+def _capture_meta(meta: dict) -> str:
+    st = console_lock.status()
+    if st and not st["held_by_me"]:  # the picture may be someone else's test
+        meta["note"] = describe_lock(st)
+    return str(meta)
+
+
+def _sheet(frames: list, labels: list[str], thumb_width: int) -> Image:
+    return Image(data=capture_mod.contact_sheet(frames, labels, thumb_width=thumb_width), format="jpeg")
+
+
+@mcp.tool(annotations=RO)
+@friendly
+def xbox_capture_photo(save_path: str | None = None, max_width: int = 1280):
+    """Photo of the console's HDMI output through the USB capture card: exactly what the TV shows
+    (any title, dashboard, scaler output), unlike xbox_screenshot which reads xbdm's framebuffer.
+    Saves a full-size PNG (save_path, or XBOX360_CAPTURE_DIR) and returns it scaled to max_width.
+    During an xbox_capture_record, returns the recording's latest frame."""
+    shot = card.photo(_local(save_path) if save_path else None)
+    jpg, size = capture_mod.preview_jpeg(shot["path"], max_width)
+    return [Image(data=jpg, format="jpeg"), _capture_meta({**shot, "size": f"{size[0]}x{size[1]}"})]
+
+
+@mcp.tool(annotations=RO)
+@friendly
+def xbox_capture_burst(count: int = 8, interval_ms: int = 250, save_dir: str | None = None, thumb_width: int = 480):
+    """Burst of `count` HDMI photos (max 120) taken `interval_ms` apart (0 = every frame the card
+    delivers, ~30/s), e.g. to catch flicker, an animation or a short glitch. Full-size JPEGs are saved
+    in save_dir; returns one contact sheet with each frame's index and time offset."""
+    b = card.burst(count, max(0, interval_ms) / 1000, _local(save_dir) if save_dir else None)
+    labels = [f"#{i} +{t:.2f}s" for i, t in enumerate(b["times"])]
+    frames = b["frames"]
+    meta = {"dir": b["dir"], "count": len(frames), "files": [Path(f).name for f in frames[:3]] + (["..."] if len(frames) > 3 else [])}
+    return [_sheet(frames[:24], labels, thumb_width), _capture_meta(meta)]
+
+
+@mcp.tool(annotations=RO)
+@friendly
+def xbox_capture_video(seconds: float = 10, save_path: str | None = None, audio: bool = True, preview_frames: int = 6):
+    """Record an HDMI clip (MP4, H.264 + sound from the capture card) and wait for it, max 300 s.
+    Returns a contact sheet of `preview_frames` frames spread over the clip plus the file path.
+    For a recording that spans other actions (launch, logs...), use xbox_capture_record instead."""
+    r = card.record(max(1.0, min(seconds, 300.0)), _local(save_path) if save_path else None, audio=audio)
+    return _video_result(r, preview_frames)
+
+
+def _video_result(r: dict, preview_frames: int) -> list:
+    out: list = []
+    if preview_frames > 0:
+        frames, times = capture_mod.sample_video(r["path"], max(1, min(preview_frames, 24)))
+        out.append(_sheet(frames, [f"{t:.1f}s" for t in times], 320))
+    out.append(_capture_meta(r))
+    return out
+
+
+@mcp.tool(annotations=RO)
+@friendly
+def xbox_capture_record(
+    action: Literal["start", "stop", "status"],
+    save_path: str | None = None,
+    audio: bool = True,
+    max_seconds: float = 600,
+    preview_frames: int = 6,
+):
+    """Background HDMI recording: start, do anything (deploy, launch, wait for logs, play...), then
+    stop, which returns the MP4 path and a contact sheet of `preview_frames` frames. The recording
+    ends by itself after max_seconds (max 3600). While it runs, xbox_capture_photo still works
+    (latest frame) but bursts and clips can't open the card. status also shows the capture devices."""
+    if action == "start":
+        return card.start_recording(_local(save_path) if save_path else None, audio=audio, max_seconds=max(5.0, min(max_seconds, 3600.0)))
+    if action == "stop":
+        return _video_result(card.stop_recording(), preview_frames)
+    return {**card.status(), "devices": card.devices(), "output_dir": str(card.out_dir)}
 
 
 # ---------------------------------------------------------------------------

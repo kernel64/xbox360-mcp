@@ -315,3 +315,91 @@ def test_cli_lock(port, lock_dir, capsys):
     assert cli.main(["--host", "127.0.0.1", "--port", str(port), "mkdir", "Hdd:/Devkit/clilock"]) == 0
     assert other.status() is None  # the CLI released it when done
     cli.main(["--host", "127.0.0.1", "--port", str(port), "rm", "Hdd:/Devkit/clilock"])
+
+
+# ---------------------------------------------------------------------------
+# HDMI capture card (ffmpeg's lavfi test sources stand in for the DirectShow device)
+# ---------------------------------------------------------------------------
+from xbox360_mcp import capture  # noqa: E402
+
+DSHOW_LIST = r"""
+[dshow @ 0001] "Integrated Webcam" (video)
+[dshow @ 0001]   Alternative name "@device_pnp_\\?\usb#vid_0c45&pid_6720"
+[dshow @ 0001] "USB Video" (video)
+[dshow @ 0001] "LSVCam" (none)
+[dshow @ 0001] "OBS Virtual Camera" (video)
+[dshow @ 0001] "Interface audionumérique (USB Digital Audio)" (audio)
+[dshow @ 0001] "Réseau de microphones (Technologie Intel® Smart Sound)" (audio)
+"""
+
+
+def test_capture_device_detection():
+    found = capture.parse_dshow_devices(DSHOW_LIST)
+    assert found["video"] == ["Integrated Webcam", "USB Video", "OBS Virtual Camera"]
+    assert capture.pick_video(found["video"]) == "USB Video"
+    assert capture.pick_audio(found["audio"]) == "Interface audionumérique (USB Digital Audio)"
+    old = '[dshow] DirectShow video devices\n[dshow]  "AVerMedia Live Gamer"\n[dshow] DirectShow audio devices\n[dshow]  "Mic"\n'
+    assert capture.parse_dshow_devices(old) == {"video": ["AVerMedia Live Gamer"], "audio": ["Mic"]}
+    with pytest.raises(capture.CaptureError, match="no capture card"):
+        capture.pick_video(["Integrated Webcam"])
+    with pytest.raises(capture.CaptureError, match="several"):
+        capture.pick_video(["USB Video", "Elgato HD60 Capture"])
+    busy = b"[dshow @ 0] Could not run graph (sometimes caused by a device already in use by other application)\n"
+    with pytest.raises(capture.CaptureBusy):
+        capture.check_ffmpeg_error(busy, "USB Video")
+
+
+@pytest.fixture
+def card(tmp_path):
+    return capture.CaptureCard(
+        # -re: produce frames in real time like a capture card (lavfi is otherwise much faster)
+        source=["-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30"],
+        audio_source=["-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"],
+        out_dir=tmp_path / "captures",
+    )
+
+
+def test_capture_photo_burst_video(card):
+    shot = card.photo()
+    assert Image.open(shot["path"]).size == (640, 360)
+    b = card.burst(5, 0.1)
+    assert len(b["frames"]) == 5 and b["times"] == [0.0, 0.1, 0.2, 0.3, 0.4]
+    sheet = Image.open(io.BytesIO(capture.contact_sheet(b["frames"], ["a", "b", "c", "d", "e"], thumb_width=160)))
+    assert sheet.format == "JPEG" and sheet.size[0] > 160 * 4
+    clip = card.record(2)
+    assert clip["audio"] and 1.5 < clip["seconds"] < 3
+    frames, times = capture.sample_video(clip["path"], 4)
+    assert len(frames) == 4 and times[0] == 0.0
+
+
+def test_capture_background_recording(card):
+    started = card.start_recording(max_seconds=30)
+    assert started["audio"]
+    time.sleep(2)
+    assert card.status()["recording"]
+    shot = card.photo()  # the card is open: comes from the recording's live frame
+    assert shot["from_recording"] == started["recording"]
+    with pytest.raises(capture.CaptureBusy):
+        card.burst(3)
+    done = card.stop_recording()
+    assert done["path"] == started["recording"] and done["seconds"] > 2 and not done["hit_max_seconds"]
+    assert card.status() == {"recording": False}
+    with pytest.raises(capture.CaptureError):
+        card.stop_recording()
+
+
+def test_server_capture_tools(server, card, monkeypatch):
+    monkeypatch.setattr(server, "card", card)
+    img, meta = server.xbox_capture_photo(max_width=320)
+    assert img.data[:2] == b"\xff\xd8" and "640x360" in meta
+    sheet, meta = server.xbox_capture_burst(count=3, interval_ms=100)
+    assert "'count': 3" in meta
+    other = ConsoleLock("127.0.0.1", owner="other session")
+    other.acquire("their test")
+    _, meta = server.xbox_capture_photo()
+    assert "other session" in meta  # warns that the picture may be someone else's test
+    other.release()
+    assert server.xbox_capture_record("start", max_seconds=20)["audio"]
+    time.sleep(1.5)
+    sheet, meta = server.xbox_capture_record("stop", preview_frames=3)
+    assert sheet.data[:2] == b"\xff\xd8" and ".mp4" in meta

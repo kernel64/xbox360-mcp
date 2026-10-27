@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.24",
     "pillow>=10",
     "capstone>=5",
+    "imageio-ffmpeg>=0.5",  # bundled ffmpeg for the HDMI capture card
 ]
 
 [project.optional-dependencies]

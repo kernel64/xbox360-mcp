@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import analysis, deploy as deploy_mod, jrpc
+from . import analysis, capture, deploy as deploy_mod, jrpc
 from .client import XboxConsole
 from .framebuffer import to_png
 from .lock import ConsoleBusy, ConsoleLock, describe as describe_lock
@@ -102,11 +102,49 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("message")
     s = sub.add_parser("raw", help="raw XBDM command")
     s.add_argument("command", nargs=argparse.REMAINDER)
+
+    s = sub.add_parser("capture", help="HDMI capture card: photo, burst, video (no --host needed)")
+    cap = s.add_subparsers(dest="capture_cmd", required=True)
+    c = cap.add_parser("devices", help="capture devices found and the ones selected")
+    c = cap.add_parser("photo", help="one frame as PNG")
+    c.add_argument("out", nargs="?")
+    c = cap.add_parser("burst", help="several frames as JPEG + a contact sheet")
+    c.add_argument("count", nargs="?", type=int, default=8)
+    c.add_argument("--interval-ms", type=int, default=250, help="0 = every frame the card delivers")
+    c.add_argument("--dir")
+    c = cap.add_parser("video", help="record a clip (MP4 with sound)")
+    c.add_argument("seconds", type=float)
+    c.add_argument("out", nargs="?")
+    c.add_argument("--no-audio", action="store_true")
     return p
+
+
+def _capture(a) -> int:
+    card = capture.CaptureCard.from_env()
+    c = a.capture_cmd
+    if c == "devices":
+        _print({"found": capture.list_devices(), "selected": card.devices(), "output_dir": str(card.out_dir)})
+    elif c == "photo":
+        print(card.photo(a.out)["path"])
+    elif c == "burst":
+        b = card.burst(a.count, a.interval_ms / 1000, a.dir)
+        sheet = Path(b["dir"]) / "sheet.jpg"
+        sheet.write_bytes(capture.contact_sheet(b["frames"], [f"#{i} +{t:.2f}s" for i, t in enumerate(b["times"])]))
+        print(f"{len(b['frames'])} frames in {b['dir']} (contact sheet: {sheet})")
+    elif c == "video":
+        r = card.record(a.seconds, a.out, audio=not a.no_audio)
+        print(f"{r['path']} ({r['seconds']} s, {'with' if r['audio'] else 'no'} sound)")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.cmd == "capture":
+        try:
+            return _capture(args)
+        except capture.CaptureError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
     if not args.host:
         print("Set --host or XBOX360_HOST", file=sys.stderr)
         return 2
