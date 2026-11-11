@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "MCP server + CLI + Python library to drive an Xbox 360 RGH/JTAG (xbdm) from Claude Code"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "Aymen" }]
+authors = [{ name = "Mohamed Aymen" }]
 dependencies = [
     "mcp>=2",
     "numpy>=1.24",
