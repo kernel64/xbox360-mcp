@@ -638,3 +638,105 @@ def test_cli_lock_status_expect(port, lock_dir, capsys):
 def test_screenshot_says_which_title_runs(server):
     _, meta = server.xbox_screenshot(max_width=320)
     assert "running_title" in meta
+
+
+# ---------------------------------------------------------------------------
+# Shared capture stream: one broker owns the card; sessions and the user's OBS read from it
+# ---------------------------------------------------------------------------
+from xbox360_mcp import broker  # noqa: E402
+
+LAVFI_VIDEO = ["-re", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30"]
+LAVFI_AUDIO = ["-re", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100"]
+
+
+def _free_port():
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.fixture
+def shared(tmp_path, monkeypatch):
+    monkeypatch.setenv("XBOX360_CACHE_DIR", str(tmp_path / "cache"))
+    port = _free_port()
+
+    def make(**kw):
+        return capture.CaptureCard(source=LAVFI_VIDEO, audio_source=LAVFI_AUDIO, out_dir=tmp_path / "captures",
+                                   shared=True, port=port, broker_idle=kw.pop("idle", 120), **kw)
+
+    yield make, port
+    broker.stop(port)
+    time.sleep(1)
+
+
+def _streams(path):
+    import subprocess
+
+    r = subprocess.run([capture.ffmpeg_exe(), "-hide_banner", "-i", str(path)], capture_output=True)
+    text = r.stderr.decode("utf-8", "replace")
+    return ("Video: h264" in text, "Audio: aac" in text, capture.media_duration(path))
+
+
+def test_shared_stream_serves_everyone_at_once(shared, tmp_path):
+    import subprocess
+
+    make, port = shared
+    a, b = make(), make()  # two sessions
+    a.photo()  # starts the broker
+    t = time.time()
+    shot = b.photo()
+    assert shot["via"] == "shared stream" and time.time() - t < 1.0
+    # the user's OBS: a viewer reading the stream for the whole test
+    viewer = subprocess.Popen([capture.ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-t", "8",
+                               "-i", a.stream_url(), "-c", "copy", "-y", str(tmp_path / "viewer.mp4")])
+    started = a.start_recording(max_seconds=30)
+    assert started["audio"]
+    time.sleep(1)
+    burst = b.burst(5, 0.1)  # works during a's recording now
+    assert len(burst["frames"]) == 5 and burst["times"][-1] >= 0.3
+    fast = b.burst(4, 0)  # consecutive frames
+    assert len(fast["frames"]) == 4
+    clip = b.record(2)  # a second recording at the same time
+    assert clip["audio"]
+    a.photo()
+    time.sleep(1)
+    done = a.stop_recording()
+    viewer.wait(timeout=30)
+    for path in (done["path"], clip["path"], tmp_path / "viewer.mp4"):
+        video, audio, seconds = _streams(path)
+        assert video and audio and seconds and seconds > 1, path
+    st = a.status()
+    assert st["shared_stream"]["url"].endswith("/xbox.ts")
+
+
+def test_broker_is_single_and_stops_when_idle(shared):
+    make, port = shared
+    card = make(idle=3)
+    card.photo()
+    pid = broker.health(port)["pid"]
+    make().photo()  # a second session reuses it
+    assert broker.health(port)["pid"] == pid
+    deadline = time.time() + 15
+    while broker.health(port) and time.time() < deadline:
+        time.sleep(0.5)
+    assert broker.health(port) is None  # stopped by itself, the card is free again
+
+
+def test_falls_back_to_the_card_when_the_stream_cant_start(shared):
+    import socket
+
+    make, port = shared
+    squatter = socket.socket()  # something else already listens on the stream's port
+    squatter.bind(("127.0.0.1", port))
+    squatter.listen(1)
+    try:
+        card = make()
+        shot = card.photo()
+        assert "via" not in shot and Image.open(shot["path"]).size == (640, 360)  # opened the source directly
+        assert card.broker_error and "status" not in card.broker_error
+    finally:
+        squatter.close()

@@ -164,9 +164,34 @@ at them yourself. This doesn't touch the console at all, so it works on any titl
 reservation.
 
 There's nothing to install: ffmpeg comes with the `imageio-ffmpeg` package. The card is detected on its
-own; webcams and virtual cameras (OBS...) are skipped. A capture card can only be used by one program
-at a time, so if OBS or another session has it open you'll get a clear "in use" error. During a
-recording, photos still work (they come from the recording itself).
+own; webcams and virtual cameras (OBS...) are skipped.
+
+### Watching the console while the agents capture
+
+A capture card can only be opened by one program at a time. At first that meant OBS blocked the
+agents, and two agents couldn't capture at once either. So now one small background process owns the
+card and shares it: the first capture starts it, every session uses it, and it stops by itself after
+10 minutes without anyone. It republishes the card as a local stream, and the agents' photos and
+bursts get the card's own frames from it, untouched (and instantly, no more 1.5 s to open the card).
+
+To watch it yourself:
+
+```powershell
+uv run xbox360 capture serve
+```
+
+starts it if needed, keeps it running until `xbox360 capture stop`, and prints the address. In OBS, add
+a **Media Source**, uncheck "Local File", and put `http://127.0.0.1:8360/xbox.ts` as the input with
+`mpegts` as the input format. VLC opens the same address (Media > Open Network Stream), and
+`http://127.0.0.1:8360/` shows the picture in a browser. Open and close them as you like, the agents
+don't notice. Just don't add the card itself ("USB Video") as a source in OBS: that grabs it for OBS
+alone.
+
+The stream is H.264 + AAC, encoded on the GPU (NVENC) when there is one, with a keyframe every second.
+Recordings copy it without re-encoding, so several sessions can record at the same time. There's a
+fraction of a second of delay, and a viewer that connects waits for the next keyframe (up to a second).
+If the stream can't start (its port is taken, for instance), captures fall back to opening the card
+directly as before.
 
 | Variable | Default | |
 |---|---|---|
@@ -175,9 +200,14 @@ recording, photos still work (they come from the recording itself).
 | `XBOX360_CAPTURE_SIZE` | `1920x1080` | |
 | `XBOX360_CAPTURE_FPS` | `30` | MS2109 cards don't really do more than 30 in 1080p |
 | `XBOX360_CAPTURE_DIR` | `~/xbox360-captures` | where photos, bursts and videos go |
+| `XBOX360_CAPTURE_SHARED` | `1` | `0` = every capture opens the card itself (old behaviour) |
+| `XBOX360_CAPTURE_PORT` | `8360` | port of the local stream |
+| `XBOX360_CAPTURE_BROKER_IDLE` | `600` | the stream stops after this many seconds without a client |
+| `XBOX360_CAPTURE_ENCODER` | `auto` | `nvenc` or `x264` to force one |
 | `XBOX360_FFMPEG` | bundled | use another ffmpeg |
 
-`xbox360 capture devices` shows what was found. It's Windows only for now (DirectShow).
+`xbox360 capture devices` shows what was found and whether the stream runs. It's Windows only for now
+(DirectShow).
 
 ## Command line
 

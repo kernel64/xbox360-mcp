@@ -594,7 +594,8 @@ def xbox_capture_photo(save_path: str | None = None, max_width: int = 1280):
     """Photo of the console's HDMI output through the USB capture card: exactly what the TV shows
     (any title, dashboard, scaler output), unlike xbox_screenshot which reads xbdm's framebuffer.
     Saves a full-size PNG (save_path, or XBOX360_CAPTURE_DIR) and returns it scaled to max_width.
-    During an xbox_capture_record, returns the recording's latest frame."""
+    The card is shared by every session and the user's viewer (OBS/VLC) through a local stream, so
+    captures from several sessions work at the same time and a photo is the newest frame (instant)."""
     shot = card.photo(_local(save_path) if save_path else None)
     jpg, size = capture_mod.preview_jpeg(shot["path"], max_width)
     return [Image(data=jpg, format="jpeg"), _capture_meta({**shot, "size": f"{size[0]}x{size[1]}"})]
@@ -640,8 +641,9 @@ def xbox_capture_record(
 ):
     """Background HDMI recording: start, do anything (deploy, launch, wait for logs, play...), then
     stop, which returns the MP4 path and a contact sheet of `preview_frames` frames. The recording
-    ends by itself after max_seconds (max 3600). While it runs, xbox_capture_photo still works
-    (latest frame) but bursts and clips can't open the card. status also shows the capture devices."""
+    ends by itself after max_seconds (max 3600). While it runs, photos, bursts and clips (yours or
+    other sessions') keep working: everything reads the shared stream. status shows the devices and
+    the stream URL the user can open in OBS / VLC."""
     if action == "start":
         return card.start_recording(_local(save_path) if save_path else None, audio=audio, max_seconds=max(5.0, min(max_seconds, 3600.0)))
     if action == "stop":

@@ -15,7 +15,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import analysis, capture, deploy as deploy_mod, jrpc
+from . import analysis, broker, capture, deploy as deploy_mod, jrpc
 from .client import XboxConsole
 from .framebuffer import to_png
 from .lock import ConsoleBusy, ConsoleLock, describe as describe_lock
@@ -120,6 +120,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("seconds", type=float)
     c.add_argument("out", nargs="?")
     c.add_argument("--no-audio", action="store_true")
+    c = cap.add_parser("serve", help="start the shared stream to watch the console in OBS/VLC while agents capture")
+    c.add_argument("--idle", type=float, default=0, help="stop after this many seconds without a client (0 = never)")
+    cap.add_parser("stop", help="stop the shared stream and free the capture card")
     return p
 
 
@@ -127,7 +130,22 @@ def _capture(a) -> int:
     card = capture.CaptureCard.from_env()
     c = a.capture_cmd
     if c == "devices":
-        _print({"found": capture.list_devices(), "selected": card.devices(), "output_dir": str(card.out_dir)})
+        _print({"found": capture.list_devices(), "selected": card.devices(), "output_dir": str(card.out_dir), **card.status()})
+    elif c == "serve":
+        card.shared = True
+        port = card._shared_port(idle=a.idle)
+        if not port:
+            print(f"error: the shared stream could not start: {card.broker_error}", file=sys.stderr)
+            return 1
+        broker.set_idle(port, a.idle)  # also when it was already running (started by an agent)
+        h = broker.health(port) or {}
+        print(f"Shared stream running (encoder {h.get('encoder')}, idle timeout {a.idle:g} s, 0 = never).")
+        print(f"  OBS:     Media Source, uncheck 'Local File', Input = {card.stream_url()}, Input Format = mpegts")
+        print(f"  VLC:     Media > Open Network Stream > {card.stream_url()}")
+        print(f"  Browser: {broker.base_url(port)}/  (picture only)")
+        print("Agents keep capturing through it. `xbox360 capture stop` frees the card.")
+    elif c == "stop":
+        print("stopped" if broker.stop(card.port) else "the shared stream wasn't running")
     elif c == "photo":
         print(card.photo(a.out)["path"])
     elif c == "burst":

@@ -7,8 +7,10 @@ ffmpeg comes from (in order) XBOX360_FFMPEG, `ffmpeg` on PATH, or the binary bun
 imageio-ffmpeg package. Devices are auto-detected (webcams and virtual cameras are skipped) or set with
 XBOX360_CAPTURE_VIDEO / XBOX360_CAPTURE_AUDIO ("none" = no sound).
 
-A capture card can only be opened by one program at a time: while a recording runs, `photo()` returns
-the recording's latest frame instead of opening the card again.
+A capture card can only be opened by one program at a time. With shared=True (the server's default,
+XBOX360_CAPTURE_SHARED) every capture goes through the broker (broker.py), which owns the card and
+streams it to all sessions and to the user's OBS/VLC. Without it (or if the broker can't start), each
+capture opens the card itself, and while a recording runs `photo()` returns its latest frame.
 """
 
 from __future__ import annotations
@@ -21,6 +23,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import broker
 
 WARMUP_FRAMES = 10  # the first MJPEG frames after opening the card are corrupt or black
 MAX_BURST = 120
@@ -213,9 +217,14 @@ class CaptureCard:
         out_dir: str | Path | None = None,
         source: list[str] | None = None,
         audio_source: list[str] | None = None,
+        shared: bool = False,
+        port: int = broker.DEFAULT_PORT,
+        broker_idle: float = 600,
     ):
         """`source` / `audio_source` replace the DirectShow devices with any ffmpeg input arguments
-        (without -i's value split off, e.g. ["-f", "lavfi", "-i", "testsrc2"]); tests use them."""
+        (without -i's value split off, e.g. ["-f", "lavfi", "-i", "testsrc2"]); tests use them.
+        shared=True goes through the broker (see broker.py): the card is opened once for every
+        session and viewer; if the broker can't start, captures open the card directly."""
         self._video = video
         self._audio = audio  # None = auto, "" = no sound
         self.size = size
@@ -223,6 +232,10 @@ class CaptureCard:
         self.out_dir = Path(out_dir or Path.home() / "xbox360-captures")
         self.source = source
         self.audio_source = audio_source
+        self.shared = shared
+        self.port = port
+        self.broker_idle = broker_idle
+        self.broker_error: str | None = None
         self.recording: Recording | None = None
         self._lock = threading.Lock()
 
@@ -235,7 +248,36 @@ class CaptureCard:
             size=os.environ.get("XBOX360_CAPTURE_SIZE", "1920x1080"),
             fps=int(os.environ.get("XBOX360_CAPTURE_FPS", "30")),
             out_dir=os.environ.get("XBOX360_CAPTURE_DIR") or None,
+            shared=os.environ.get("XBOX360_CAPTURE_SHARED", "1").lower() not in ("0", "false", "no", "off"),
+            port=int(os.environ.get("XBOX360_CAPTURE_PORT", str(broker.DEFAULT_PORT))),
+            broker_idle=float(os.environ.get("XBOX360_CAPTURE_BROKER_IDLE", "600")),
         )
+
+    # -- shared broker -----------------------------------------------------------
+    def broker_spec(self) -> dict:
+        inputs, audio_map = self._input(audio=True)
+        dev = self.devices()
+        return {
+            "input": inputs, "audio_map": audio_map, "mjpeg": self.source is None, "fps": self.fps,
+            "video": dev["video"], "audio": dev["audio"], "warmup": WARMUP_FRAMES if self.source is None else 0,
+        }
+
+    def _shared_port(self, *, idle: float | None = None) -> int | None:
+        """Port of the running (or just started) broker, None to open the card directly."""
+        if not self.shared:
+            return None
+        try:
+            broker.ensure_broker(self.broker_spec(), self.port, idle=self.broker_idle if idle is None else idle)
+        except RuntimeError as e:
+            if "in use" in str(e):
+                raise CaptureBusy(str(e)) from None  # opening the card directly would fail the same way
+            self.broker_error = str(e)
+            return None
+        self.broker_error = None
+        return self.port
+
+    def stream_url(self) -> str:
+        return broker.base_url(self.port) + "/xbox.ts"
 
     # -- devices ---------------------------------------------------------------
     def devices(self) -> dict:
@@ -277,9 +319,19 @@ class CaptureCard:
 
     # -- photo / burst -----------------------------------------------------------
     def photo(self, path: str | Path | None = None) -> dict:
-        """One frame as PNG. During a recording, returns the recording's latest frame (≤0.5 s old)."""
+        """One frame as PNG. Shared: the broker's newest frame, at once. Direct: opens the card
+        (~1.5 s); during a recording, returns the recording's latest frame (≤0.5 s old)."""
         out = Path(path) if path else self._new_path("photo", ".png")
         out.parent.mkdir(parents=True, exist_ok=True)
+        port = self._shared_port()
+        if port:
+            import io
+
+            from PIL import Image
+
+            seq, when, jpeg = broker.latest_frame(port)
+            Image.open(io.BytesIO(jpeg)).save(out)
+            return {"path": str(out), "via": "shared stream", "frame_age_s": round(time.time() - when, 2)}
         rec = self.recording
         if rec and rec.running:
             if not rec.latest.exists():
@@ -300,10 +352,13 @@ class CaptureCard:
 
     def burst(self, count: int = 8, interval: float = 0.25, out_dir: str | Path | None = None) -> dict:
         """`count` frames `interval` seconds apart (0 = every frame the card delivers), as JPEG files."""
-        self._check_free()
         count = max(1, min(int(count), MAX_BURST))
         folder = Path(out_dir) if out_dir else self._new_path("burst", "")
         folder.mkdir(parents=True, exist_ok=True)
+        port = self._shared_port()
+        if port:
+            return self._shared_burst(port, count, interval, folder)
+        self._check_free()
         vf = f"select=gte(n\\,{WARMUP_FRAMES})"
         if interval > 0:
             vf += f",fps=1/{interval:g}"
@@ -319,7 +374,33 @@ class CaptureCard:
         step = interval if interval > 0 else 1 / self.fps
         return {"dir": str(folder), "frames": [str(f) for f in frames], "times": [round(i * step, 3) for i in range(len(frames))]}
 
+    @staticmethod
+    def _shared_burst(port: int, count: int, interval: float, folder: Path) -> dict:
+        """The card's own JPEG frames, untouched. interval 0 = consecutive frames."""
+        frames, times, seq, first, start = [], [], None, None, time.time()
+        for i in range(count):
+            if interval > 0 and i:
+                time.sleep(max(0.0, start + i * interval - time.time()))
+            seq, when, jpeg = broker.latest_frame(port, after=seq, newest=interval > 0)
+            first = when if first is None else first
+            f = folder / f"frame_{i + 1:03d}.jpg"
+            f.write_bytes(jpeg)
+            frames.append(str(f))
+            times.append(round(when - first, 3))
+        return {"dir": str(folder), "frames": frames, "times": times, "via": "shared stream"}
+
     # -- video -------------------------------------------------------------------
+    def _shared_record_args(self, port: int, path: Path, seconds: float, audio: bool) -> tuple[list[str], bool]:
+        """Copy the broker's H.264 + AAC stream: no re-encoding, any number at once. The clip starts
+        at the stream's next keyframe (at most 1 s)."""
+        has_audio = audio and bool(self.broker_spec()["audio_map"])
+        args = ["-t", f"{seconds:g}", "-i", broker.base_url(port) + "/xbox.ts", "-map", "0:v"]
+        # AAC in MPEG-TS has ADTS headers that MP4 doesn't accept: without the filter the mux fails
+        # and the file is never finalised
+        args += ["-map", "0:a?", "-bsf:a", "aac_adtstoasc"] if has_audio else []
+        args += ["-c", "copy", "-movflags", "+frag_keyframe+empty_moov", "-y", str(path)]
+        return args, has_audio
+
     def _record_args(self, path: Path, audio: bool, seconds: float, latest: Path | None) -> tuple[list[str], bool]:
         inputs, audio_map = self._input(audio, seconds)
         args = [*inputs, "-map", "0:v"]
@@ -336,10 +417,14 @@ class CaptureCard:
 
     def record(self, seconds: float, path: str | Path | None = None, *, audio: bool = True) -> dict:
         """Record a clip and wait for it (MP4, H.264 + AAC)."""
-        self._check_free()
         out = Path(path) if path else self._new_path("video", ".mp4")
         out.parent.mkdir(parents=True, exist_ok=True)
-        args, has_audio = self._record_args(out, audio, seconds, None)
+        port = self._shared_port()
+        if port:
+            args, has_audio = self._shared_record_args(port, out, seconds, audio)
+        else:
+            self._check_free()
+            args, has_audio = self._record_args(out, audio, seconds, None)
         with self._lock:
             r = _run(args, timeout=seconds + 30)
         if not out.exists() or out.stat().st_size == 0:
@@ -348,11 +433,17 @@ class CaptureCard:
 
     def start_recording(self, path: str | Path | None = None, *, audio: bool = True, max_seconds: float = 600) -> dict:
         """Start recording in the background (stopped by stop_recording or after max_seconds)."""
-        self._check_free()
+        if self.recording and self.recording.running:
+            raise CaptureBusy("this session is already recording: stop it first (xbox_capture_record stop)")
         out = Path(path) if path else self._new_path("video", ".mp4")
         out.parent.mkdir(parents=True, exist_ok=True)
         latest = out.with_suffix(".latest.jpg")
-        args, has_audio = self._record_args(out, audio, max_seconds, latest)
+        port = self._shared_port()
+        if port:
+            args, has_audio = self._shared_record_args(port, out, max_seconds, audio)
+        else:
+            self._check_free()
+            args, has_audio = self._record_args(out, audio, max_seconds, latest)
         proc = _popen(["-loglevel", "error", *args], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         rec = Recording(out, time.time(), max_seconds, has_audio, proc, latest)
         threading.Thread(target=lambda: rec.stderr.append(proc.stderr.read()), daemon=True).start()
@@ -393,8 +484,19 @@ class CaptureCard:
     def status(self) -> dict:
         rec = self.recording
         if rec is None:
-            return {"recording": False}
-        return {"recording": rec.running, "path": str(rec.path), "elapsed_s": round(rec.elapsed, 1), "max_seconds": rec.max_seconds}
+            out: dict = {"recording": False}
+        else:
+            out = {"recording": rec.running, "path": str(rec.path), "elapsed_s": round(rec.elapsed, 1), "max_seconds": rec.max_seconds}
+        if self.shared:
+            h = broker.health(self.port)
+            out["shared_stream"] = (
+                {"url": self.stream_url(), "viewer_page": broker.base_url(self.port) + "/", "encoder": h.get("encoder"),
+                 "viewers": h.get("ts_clients"), "idle_timeout_s": h.get("idle_timeout_s")}
+                if h else "not running (starts with the next capture, or `xbox360 capture serve`)"
+            )
+            if self.broker_error:
+                out["shared_stream_error"] = self.broker_error + " (captures open the card directly)"
+        return out
 
 
 # ---------------------------------------------------------------------------
