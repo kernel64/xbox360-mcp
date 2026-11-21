@@ -64,6 +64,10 @@ class Console:
         self.breakpoints: set[int] = set()
         self.screen, self.screen_raw = make_screen()
         self.jrpc = True
+        self.debugger = False
+        self.open_by_title: set[str] = set()  # files the running title holds open: getfile refused
+        self.drop_next_sendfile = False  # simulate the connection dropping (another session's reboot)
+        self.running = "\\Device\\Harddisk0\\Partition1\\Apps\\demo\\default.xex"  # xbeinfo running
 
     def emit(self, line: str) -> None:
         for s in list(self.notifiers):
@@ -130,7 +134,7 @@ class Handler(socketserver.BaseRequestHandler):
             elif verb == "systeminfo":
                 self.multi(["HDD=Enabled", "Type=TestKit", "Platform=Trinity System=2.0.17559.0", "BaseKrnl=2.0.1888.0 Krnl=2.0.17559.0 XDK=2.0.21256.0"])
             elif verb == "xbeinfo":
-                self.multi(['timestamp=0x00000000 checksum=0x00000000', 'name="\\Device\\Harddisk0\\Partition1\\Apps\\demo\\default.xex"'])
+                self.multi(['timestamp=0x00000000 checksum=0x00000000', f'name="{c.running}"'])
             elif verb == "drivelist":
                 self.multi(['drivename="Hdd"', 'drivename="Usb0"'])
             elif verb == "drivefreespace":
@@ -159,6 +163,9 @@ class Handler(socketserver.BaseRequestHandler):
                 if key not in c.files:
                     self.send("402- file not found")
                     continue
+                if key in c.open_by_title:
+                    self.send("414- access denied")
+                    continue
                 data = c.files[key]
                 off = kv.get("offset", 0)
                 size = kv.get("size", len(data) - off)
@@ -166,6 +173,9 @@ class Handler(socketserver.BaseRequestHandler):
                 self.send("203- binary response follows")
                 self.request.sendall(struct.pack("<I", len(data)) + data)
             elif verb == "sendfile":
+                if c.drop_next_sendfile:
+                    c.drop_next_sendfile = False
+                    return  # close the connection without answering
                 n = kv["length"]
                 parent = key.rpartition("\\")[0]
                 if parent.endswith(":"):
@@ -193,6 +203,9 @@ class Handler(socketserver.BaseRequestHandler):
                 self.send("200- OK")
             elif verb == "rename":
                 new = _norm(str(kv["newname"]))
+                if new in c.files or new in c.dirs:
+                    self.send("410- file already exists")
+                    continue
                 if key in c.files:
                     c.files[new] = c.files.pop(key)
                 self.send("200- OK")
@@ -207,6 +220,7 @@ class Handler(socketserver.BaseRequestHandler):
                 c.notifiers.clear()
                 return
             elif verb == "debugger":
+                c.debugger = "connect" in kv  # global to the console, like real xbdm
                 self.send("200- OK")
             elif verb == "notify":
                 if "reconnectport" not in kv:  # same as a real console
@@ -219,7 +233,12 @@ class Handler(socketserver.BaseRequestHandler):
                     c.pending_boot = None
 
                     def boot():
+                        # the previous title's teardown comes first, like on a real console
+                        for i in range(30):
+                            c.emit(f"debugstr thread=0xf9000004 lf string=[aurora] terminate thread {i}")
+                        c.emit('modunload name="dll.aurora.ftp"')
                         time.sleep(0.3)
+                        c.running = title
                         c.emit("execution started")
                         c.emit(f'modload name="default.xex" base=0x82000000 size=0x00010000')
                         c.emit("debugstr thread=0xf9000004 lf string=[demo] booting " + title)

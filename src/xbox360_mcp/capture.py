@@ -49,14 +49,69 @@ def ffmpeg_exe() -> str:
         raise CaptureError("ffmpeg not found: install imageio-ffmpeg or set XBOX360_FFMPEG") from e
 
 
-def _run(args: list[str], timeout: float) -> subprocess.CompletedProcess:
+_JOB = None
+_JOB_LOCK = threading.Lock()
+
+
+def kill_with_us(proc: subprocess.Popen) -> None:
+    """Make Windows kill `proc` when this process ends, however it ends (Claude Code crash, kill).
+    Otherwise an orphaned ffmpeg keeps the capture card open and every later capture fails."""
+    if os.name != "nt":
+        return
+    global _JOB
     try:
-        return subprocess.run(
-            [ffmpeg_exe(), "-hide_banner", *args], capture_output=True, timeout=timeout,
-            stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        with _JOB_LOCK:
+            if _JOB is None:
+                class Basic(ctypes.Structure):
+                    _fields_ = [
+                        ("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD),
+                    ]
+
+                class Extended(ctypes.Structure):
+                    _fields_ = [
+                        ("BasicLimitInformation", Basic), ("IoInfo", ctypes.c_uint64 * 6),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t),
+                    ]
+
+                k32.CreateJobObjectW.restype = wintypes.HANDLE
+                k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+                job = k32.CreateJobObjectW(None, None)
+                info = Extended()
+                info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+                k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # ExtendedLimitInformation
+                _JOB = job  # never closed: the handle goes away with this process, which kills the job
+        k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+        k32.AssignProcessToJobObject(_JOB, int(proc._handle))
+    except Exception:
+        pass  # best effort: atexit still stops a recording on a normal exit
+
+
+def _popen(args: list[str], **kw) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [ffmpeg_exe(), "-hide_banner", *args], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kw
+    )
+    kill_with_us(proc)
+    return proc
+
+
+def _run(args: list[str], timeout: float) -> subprocess.CompletedProcess:
+    proc = _popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as e:
+        proc.kill()
+        proc.communicate()
         raise CaptureError(f"ffmpeg did not finish within {timeout:.0f} s (no signal on the HDMI input?)") from e
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
 
 
 def _errors(stderr: bytes) -> str:
@@ -298,11 +353,7 @@ class CaptureCard:
         out.parent.mkdir(parents=True, exist_ok=True)
         latest = out.with_suffix(".latest.jpg")
         args, has_audio = self._record_args(out, audio, max_seconds, latest)
-        proc = subprocess.Popen(
-            [ffmpeg_exe(), "-hide_banner", "-loglevel", "error", *args],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        proc = _popen(["-loglevel", "error", *args], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         rec = Recording(out, time.time(), max_seconds, has_audio, proc, latest)
         threading.Thread(target=lambda: rec.stderr.append(proc.stderr.read()), daemon=True).start()
         time.sleep(1.5)  # opening the card: report a busy/missing device right away

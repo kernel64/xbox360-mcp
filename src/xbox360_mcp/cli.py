@@ -46,7 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="if another session has the console reserved, wait up to SECONDS for it (default: fail at once)",
     )
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("lock-status", help="who has the console reserved")
+    s = sub.add_parser("lock-status", help="who has the console reserved")
+    s.add_argument(
+        "--expect", metavar="OWNER",
+        help="exit 0 only if OWNER holds the console (5 otherwise): put it at the top of console scripts",
+    )
     s = sub.add_parser("unlock", help="clear a stuck reservation held by another session")
     s.add_argument("--force", action="store_true", required=True)
 
@@ -152,6 +156,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "lock-status":
         st = lock.status()
         print(describe_lock(st) if st else "free")
+        if args.expect is not None and not (st and str(st["owner"]).lower() == args.expect.lower()):
+            print(f"error: the console is not reserved by {args.expect}: don't run", file=sys.stderr)
+            return 5
         return 0
     if args.cmd == "unlock":
         print("reservation cleared" if lock.release(force=True) else "nothing to clear")
@@ -203,9 +210,7 @@ def _dispatch(x: XboxConsole, a) -> int:
             for e in x.list_dir(a.path):
                 print(f"{'<DIR>' if e['is_dir'] else e['size']:>12}  {e['modified'] or '':<32} {e['name']}")
     elif c == "get":
-        data = x.download(a.remote)
-        Path(a.local).write_bytes(data)
-        print(f"{len(data)} bytes -> {a.local}")
+        print(f"{x.download_to(a.remote, a.local)} bytes -> {a.local}")
     elif c == "put":
         size = x.upload_file(a.remote, a.local)
         print(f"{size} bytes -> {normalize_path(a.remote)}")

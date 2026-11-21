@@ -68,13 +68,15 @@ What it has to work with:
 
 - **console**: status, drives, reboot, on-screen notification, raw xbdm command;
 - **files**: list, download, read a text file, upload, create, rename, delete;
-- **dev loop**: `xbox_deploy` only sends the files that changed, then can launch the xex and wait for
-  a specific log line; `xbox_launch` starts a xex that's already on the console;
+- **dev loop**: `xbox_deploy` only sends the files that changed, then can launch the xex, wait for
+  a specific log line and even wait until the title exits (handy before reading its log file, which
+  the running title keeps locked); `xbox_launch` starts a xex that's already on the console. The log
+  they return starts when your title loads, not with the previous title's teardown;
 - **logs**: everything the title sends through `OutputDebugString`/`DbgPrint`, plus exceptions,
   module loads and so on, captured continuously in the background;
 - **screen**: framebuffer screenshot, returned straight as an image;
-- **debug**: crash report (stopped threads, registers, PC/LR resolved as `module+offset`, backtrace,
-  disassembly), threads, breakpoints, stop/go;
+- **debug**: attach/detach the debugger on demand, crash report (stopped threads, registers, PC/LR
+  resolved as `module+offset`, backtrace, disassembly), threads, breakpoints, stop/go;
 - **memory**: read, write, pattern search with wildcards, PowerPC disassembly (capstone),
   memory map, modules.
 
@@ -90,16 +92,21 @@ Everything goes through environment variables:
 | `XBOX360_DEPLOY_ROOT` | `Hdd:\Devkit` | where `xbox_deploy` puts builds by default |
 | `XBOX360_LOG_FILE` | | if set, every log line is also written to this file |
 | `XBOX360_READ_ONLY` | `0` | see below |
-| `XBOX360_ATTACH_DEBUGGER` | `1` | see below |
+| `XBOX360_ATTACH_DEBUGGER` | `0` | see below |
 | `XBOX360_LOCK_LEASE` | `600` | how long a reservation lasts without activity, in seconds (see below) |
 | `XBOX360_OWNER` | project folder | name other sessions see when you hold the console |
 
 **Read-only mode.** With `XBOX360_READ_ONLY=1`, nothing can be written, deleted, launched or
 rebooted, and the raw command only accepts known read commands. I'd start like that to try it out.
 
-**Debugger.** By default the tool attaches as a debugger. The point is that a crash freezes the game
-instead of dropping back to the dashboard, so you can actually go look at what happened. In read-only
-mode it doesn't attach, unless you force `XBOX360_ATTACH_DEBUGGER=1`.
+**Debugger.** The tool used to attach as xbdm's debugger all the time, and that turned out to be a bad
+idea. While a debugger is attached, xbdm replays every first-chance fault forever, so an emulator that
+relies on SEH for fastmem or its JIT just hangs. Aurora's Nova plugin also faults constantly and floods
+xbdm, and XDK tools like `xbreboot` can hang too. So it stays detached now, and taking the console
+even clears a debugger that something else left behind. When you actually want to look at a crash,
+Claude calls `xbox_debugger(action="attach")`, reproduces it (the title then stops instead of
+going back to the dashboard), runs `xbox_crash_report`, and detaches again. `xbox_unlock` detaches
+too.
 
 **Protected folders.** Even outside read-only mode, delete and rename refuse drive roots, `Flash:`,
 `Hdd:\Content` (profiles, DLC, title updates) and `Hdd:\Cache`. If you know what you're doing, the
@@ -119,10 +126,21 @@ Claude can either wait in line (`xbox_lock(wait_seconds=...)`) or go do somethin
 (listing files, memory, status...) are always allowed.
 
 The reservation lives in a small file under `~/.xbox360-mcp/locks/`, so it works across every session
-and the CLI on the same PC. It renews itself with each tool call from the holder and goes away on its
-own after `XBOX360_LOCK_LEASE` seconds of inactivity, or as soon as the holder's process is gone (when
+and the CLI on the same PC. Every `xbox_*` call from the holder renews it, and it goes away on its own
+after `XBOX360_LOCK_LEASE` seconds of inactivity, or as soon as the holder's process is gone (when
 you close that Claude Code window, for instance). If one ever gets stuck anyway,
 `xbox360 unlock --force` clears it.
+
+A few things I learned the hard way with several agents sharing one console:
+
+- `xbox_lock` waits at most 110 s, because Claude Code moves longer calls to the background and agents
+  then started their scripts before they actually had the console. Past that it fails with who holds
+  it; calling it again keeps waiting.
+- FTP uploads, `xbreboot` and other scripts don't renew the reservation. For a long scripted run, take
+  it with `xbox_lock(reason=..., lease_seconds=1800)`.
+- Scripts can check they really have the console before doing anything:
+  `xbox360 lock-status --expect Harissa64 || exit 1`.
+- A session and its subagents share the same server, so they share one reservation.
 
 The CLI follows the same rules: write commands take the reservation for as long as they run, and
 `--wait-lock 300` makes them wait their turn instead of failing. `xbox360 lock-status` tells you who

@@ -241,6 +241,17 @@ def is_read_only_command(command: str) -> bool:
     return verb in READ_ONLY_COMMANDS
 
 
+def title_matches(running_name: str | None, xex: str) -> bool:
+    """Whether xbdm's running title (`\\Device\\Harddisk0\\Partition1\\Apps\\Foo\\default.xex`) is
+    the xex we launched (`Hdd:\\Apps\\Foo\\default.xex`): drive names differ, so compare the folder
+    and file name."""
+    if not running_name:
+        return False
+    tail = [p for p in re.split(r"[\\/:]+", xex.lower()) if p][-2:]
+    have = [p for p in re.split(r"[\\/:]+", running_name.lower()) if p][-2:]
+    return tail == have
+
+
 def console_dirname(path: str) -> str:
     p = normalize_path(path)
     head, _, _ = p.rpartition("\\")

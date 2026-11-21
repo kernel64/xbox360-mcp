@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import socket
 import struct
 import threading
@@ -32,6 +33,7 @@ from .protocol import (
     parse_kv,
     parse_status,
     quote,
+    title_matches,
 )
 
 T = TypeVar("T")
@@ -123,6 +125,14 @@ class XbdmConnection:
 
     def read_exact(self, n: int) -> bytes:
         while len(self._buf) < n:
+            self._recv_more()
+        data = bytes(self._buf[:n])
+        del self._buf[:n]
+        return data
+
+    def read_some(self, n: int) -> bytes:
+        """Up to n bytes (at least 1): for streaming large payloads without buffering them."""
+        if not self._buf:
             self._recv_more()
         data = bytes(self._buf[:n])
         del self._buf[:n]
@@ -354,15 +364,59 @@ class XboxConsole:
                 command += f" size=0x{size:x}"
 
         def go(c: XbdmConnection) -> bytes:
-            resp = c.command(command)
-            if resp.code != BINARY:
-                raise XbdmError(resp.code, f"expected binary response, got {resp.message}", command)
-            (length,) = struct.unpack("<I", c.read_exact(4))
+            (length,) = struct.unpack("<I", self._getfile_start(c, command))
             return c.read_exact(length)
 
         return self._run(go)
 
+    @staticmethod
+    def _getfile_start(c: XbdmConnection, command: str) -> bytes:
+        """Send getfile, return the 4-byte length header. A refusal of a file that exists is most
+        often the running title holding it open: say so (agents kept guessing)."""
+        try:
+            resp = c.command(command)
+        except XbdmError as e:
+            if e.code == 402:
+                raise
+            raise XbdmError(
+                e.code,
+                f"{e.message}. If the running title has this file open, xbdm can't read it until the "
+                "title exits (xbox_launch wait_exit, or read it from Aurora afterwards)",
+                command,
+            ) from None
+        if resp.code != BINARY:
+            raise XbdmError(resp.code, f"expected binary response, got {resp.message}", command)
+        return c.read_exact(4)
+
+    def download_to(self, path: str, local_path: str | Path, *, chunk: int = 1 << 20) -> int:
+        """Stream a console file to disk (constant memory: fine for multi-GB files). Written to
+        <local>.part first, renamed when complete. Returns the size."""
+        local = Path(local_path)
+        local.parent.mkdir(parents=True, exist_ok=True)
+        part = local.with_name(local.name + ".part")
+        command = f"getfile name={quote(normalize_path(path))}"
+
+        def go(c: XbdmConnection) -> int:
+            (length,) = struct.unpack("<I", self._getfile_start(c, command))
+            with open(part, "wb") as f:
+                remaining = length
+                while remaining:
+                    data = c.read_some(min(chunk, remaining))
+                    f.write(data)
+                    remaining -= len(data)
+            return length
+
+        try:
+            size = self._run(go)
+        except BaseException:
+            part.unlink(missing_ok=True)
+            raise
+        os.replace(part, local)
+        return size
+
     def _sendfile(self, path: str, length: int, send: Callable[[XbdmConnection], None]) -> None:
+        """sendfile overwrites, so it is retried once on a dropped connection (seen right after
+        another session's launch or reboot)."""
         p = normalize_path(path)
         command = f"sendfile name={quote(p)} length=0x{length:x}"
 
@@ -373,7 +427,7 @@ class XboxConsole:
             send(c)
             c.read_response(command)
 
-        self._run(go, retry=False)
+        self._run(go)
 
     def upload(self, path: str, data: bytes) -> None:
         self._sendfile(path, len(data), lambda c: c.send_bytes(data))
@@ -383,7 +437,12 @@ class XboxConsole:
         local = Path(local_path)
         size = local.stat().st_size
         with open(local, "rb") as f:
-            self._sendfile(path, size, lambda c: c.send_stream(f, size))
+
+            def send(c: XbdmConnection) -> None:
+                f.seek(0)  # from the start again if the first attempt was cut
+                c.send_stream(f, size)
+
+            self._sendfile(path, size, send)
         return size
 
     def mkdir(self, path: str, *, exist_ok: bool = True) -> None:
@@ -406,7 +465,7 @@ class XboxConsole:
         if not force and is_protected_path(path):
             raise PermissionError(
                 f"Refusing to modify protected path {path} (drive root, Flash:, Hdd:\\Content, Hdd:\\Cache); "
-                "pass force=True if you really mean it"
+                "only the user can do it, with `xbox360 rm --force` (or force=True in the Python library)"
             )
 
     def delete(self, path: str, *, recursive: bool = False, force: bool = False) -> int:
@@ -427,11 +486,22 @@ class XboxConsole:
         self.cmd(f"delete name={quote(p)} dir")
         return count + 1
 
-    def rename(self, src: str, dst: str, *, force: bool = False) -> None:
+    def rename(self, src: str, dst: str, *, overwrite: bool = False, force: bool = False) -> bool:
+        """Rename / move on the same drive. xbdm refuses an existing destination (410): with
+        overwrite=True an existing destination *file* is deleted first. Returns whether one was."""
         s, d = normalize_path(src), normalize_path(dst)
         self._check_protected(s, force)
         self._check_protected(d, force)
+        replaced = False
+        if overwrite:
+            st = self.stat(d)
+            if st is not None:
+                if st["is_dir"]:
+                    raise XbdmError(410, f"destination {d} is a folder: not overwritten", "rename")
+                self.cmd(f"delete name={quote(d)}")
+                replaced = True
         self.cmd(f"rename name={quote(s)} newname={quote(d)}")
+        return replaced
 
     def walk(self, path: str) -> Iterable[tuple[str, dict]]:
         root = normalize_path(path)
@@ -448,17 +518,44 @@ class XboxConsole:
         command = f"magicboot title={quote(p)} directory={quote(d)}"
         self._fire_and_forget(command)
 
+    def wait_title_exit(self, xex: str, timeout: float, *, poll: float = 2.0, start_timeout: float = 30.0) -> dict:
+        """Wait until the title launched from `xex` has started, then until something else runs
+        (usually the dashboard). The console is briefly unreachable while titles switch."""
+        started_at = time.time()
+        deadline = started_at + timeout
+        started = False
+        now = None
+        while time.time() < deadline:
+            try:
+                now = self.running_title().get("name")
+            except XbdmConnectionError:
+                now = None  # switching titles
+            if now:
+                if title_matches(now, xex):
+                    started = True
+                elif started or time.time() - started_at > start_timeout:
+                    return {"exited": True, "after_s": round(time.time() - started_at, 1), "now_running": now, "seen_running": started}
+            time.sleep(poll)
+        return {"exited": False, "timed_out_after_s": round(timeout, 1), "now_running": now, "seen_running": started}
+
     def reboot(self, cold: bool = False) -> None:
         self._fire_and_forget("magicboot cold" if cold else "magicboot")
 
     def _fire_and_forget(self, command: str) -> None:
-        """For commands after which the console drops the connection."""
+        """For commands after which the console drops the connection. Failing to reach the console
+        is an error; only a drop once the command is sent counts as success."""
         with self._lock:
             try:
-                c = self._ensure()
-                c.command(command)
-            except XbdmConnectionError:
-                pass  # the console often drops the socket immediately
+                try:
+                    c = self._ensure()
+                except XbdmConnectionError:
+                    self._conn.close()
+                    time.sleep(0.3)
+                    c = self._ensure()  # still unreachable: raise
+                try:
+                    c.command(command)
+                except XbdmConnectionError:
+                    pass  # the console often drops the socket right after accepting it
             finally:
                 self._conn.close()
 
@@ -516,6 +613,18 @@ class XboxConsole:
 
     def clear_all_breakpoints(self) -> None:
         self.cmd("break clearall")
+
+    # xbdm's debugger registration is global to the console, not tied to the connection that made it:
+    # a detach from any connection undoes an attach made by another program or session.
+    DEBUGGER_CONNECT = 'debugger connect override name="xbox360-mcp" user="claude"'
+
+    def debugger_attach(self) -> None:
+        """While attached, xbdm stops a title on exceptions (crash inspection) but replays every
+        first-chance fault forever: titles relying on SEH (fastmem, JIT) hang."""
+        self.cmd(self.DEBUGGER_CONNECT)
+
+    def debugger_detach(self) -> None:
+        self.cmd("debugger disconnect")
 
     # -- memory ----------------------------------------------------------
     def memory_map(self) -> list[dict]:

@@ -19,7 +19,7 @@ class Config:
     port: int = 730
     timeout: float = 10.0
     read_only: bool = False
-    attach_debugger: bool = True
+    attach_debugger: bool = False
     log_file: str | None = None
     default_deploy_root: str = "Hdd:\\Devkit"
     lock_lease: float = 600.0
@@ -37,8 +37,10 @@ class Config:
             port=int(os.environ.get("XBOX360_PORT", "730")),
             timeout=float(os.environ.get("XBOX360_TIMEOUT", "10")),
             read_only=read_only,
-            # attaching changes how a crash behaves (the title freezes): not by default in read-only mode
-            attach_debugger=_bool("XBOX360_ATTACH_DEBUGGER", not read_only),
+            # Off by default: with a debugger attached, xbdm replays first-chance faults forever (titles
+            # relying on SEH for fastmem / JIT hang), Aurora's Nova plugin floods it with exceptions and
+            # XDK tools (xbreboot) can hang. Attach on demand with xbox_debugger to inspect a crash.
+            attach_debugger=_bool("XBOX360_ATTACH_DEBUGGER", False),
             log_file=os.environ.get("XBOX360_LOG_FILE") or None,
             default_deploy_root=os.environ.get("XBOX360_DEPLOY_ROOT", "Hdd:\\Devkit"),
             lock_lease=float(os.environ.get("XBOX360_LOCK_LEASE", "600")),

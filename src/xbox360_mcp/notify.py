@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 
-from .client import XbdmConnection
+from .client import XbdmConnection, XboxConsole
 from .protocol import DEDICATED, XbdmConnectionError, parse_kv, parse_status
 
 
@@ -57,7 +57,7 @@ class NotificationListener:
         port: int = 730,
         *,
         capacity: int = 20000,
-        attach_debugger: bool = True,
+        attach_debugger: bool = False,
         log_file: str | None = None,
     ):
         self.host = host
@@ -109,7 +109,7 @@ class NotificationListener:
                 conn.connect()
                 if self.attach_debugger:
                     try:
-                        conn.command('debugger connect override name="xbox360-mcp" user="claude"', check=False)
+                        conn.command(XboxConsole.DEBUGGER_CONNECT, check=False)
                     except XbdmConnectionError:
                         raise
                 # real xbdm answers a bare `notify` with "400- missing reconnectport". reconnectport
@@ -132,7 +132,7 @@ class NotificationListener:
                         kind, text, fields = parse_notification(line)
                         self._push(kind, text, fields)
             except (XbdmConnectionError, OSError) as e:
-                if self.connected:
+                if self.connected and not self._stop.is_set():  # stop() closing the socket isn't a loss
                     self._push("mcp", f"notification channel lost: {e}", {})
                 self.last_error = str(e)
             finally:

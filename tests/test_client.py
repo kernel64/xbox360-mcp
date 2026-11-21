@@ -10,7 +10,8 @@ from xbox360_mcp import ConsoleBusy, ConsoleLock, analysis, deploy, jrpc
 from xbox360_mcp.client import XboxConsole
 from xbox360_mcp.framebuffer import to_png
 from xbox360_mcp.notify import NotificationListener, parse_notification
-from xbox360_mcp.protocol import XbdmError, is_protected_path, is_read_only_command, normalize_path, parse_kv
+from mcp.server.mcpserver.exceptions import ToolError, UnexpectedToolError
+from xbox360_mcp.protocol import XbdmConnectionError, XbdmError, is_protected_path, is_read_only_command, normalize_path, parse_kv
 
 
 @pytest.fixture(scope="module")
@@ -206,18 +207,18 @@ def test_server_read_only_mode(server, monkeypatch):
     monkeypatch.setattr(server.cfg, "read_only", True)
     assert server.xbox_raw_command("dbgname")["message"] == "MockXenon"
     for cmd in ("setmem addr=0x82000000 data=00", "consolefeatures ver=2 type=12"):
-        with pytest.raises(PermissionError):
+        with pytest.raises(ToolError, match="Refused: read-only mode"):
             server.xbox_raw_command(cmd)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ToolError, match="read-only mode"):
         server.xbox_notify("hi")
-    with pytest.raises(PermissionError):
+    with pytest.raises(ToolError, match="read-only mode"):
         server.xbox_delete("Hdd:/log.txt")
 
 
 def test_server_delete_protection(server):
-    with pytest.raises(PermissionError):
+    with pytest.raises(ToolError, match="protected path"):
         server.xbox_delete("Hdd:/Content/0000000000000000", recursive=True)
-    with pytest.raises(PermissionError):
+    with pytest.raises(ToolError, match="protected path"):
         server.xbox_delete("Hdd:/")
     assert server.xbox.exists("Hdd:/Content/0000000000000000/profile")
 
@@ -281,10 +282,10 @@ def test_lock_expires_and_survives_dead_holder(lock_dir):
 def test_server_respects_other_session(server):
     other = ConsoleLock("127.0.0.1", owner="other session")
     other.acquire("their test")
-    with pytest.raises(ConsoleBusy) as e:
+    with pytest.raises(ToolError) as e:
         server.xbox_mkdir("Hdd:/Devkit/locktest")
-    assert "other session" in str(e.value) and "xbox_lock" in str(e.value)
-    with pytest.raises(ConsoleBusy):
+    assert "Console reserved by other session" in str(e.value) and "xbox_lock" in str(e.value)
+    with pytest.raises(ToolError, match="reserved by"):
         server.xbox_raw_command("magicboot")
     assert server.xbox_raw_command("dbgname")["message"] == "MockXenon"  # reads still work
     assert server.xbox_lock_status()["owner"] == "other session"
@@ -403,3 +404,237 @@ def test_server_capture_tools(server, card, monkeypatch):
     time.sleep(1.5)
     sheet, meta = server.xbox_capture_record("stop", preview_frames=3)
     assert sheet.data[:2] == b"\xff\xd8" and ".mp4" in meta
+
+
+# ---------------------------------------------------------------------------
+# Agents' bug reports (2026-11-21)
+# ---------------------------------------------------------------------------
+def _mcp_call(server, name, args):
+    import asyncio
+
+    return asyncio.run(server.mcp.call_tool(name, args))
+
+
+def test_every_tool_reports_its_error_text(server):
+    """mcp >= 2 replaces any exception that isn't a ToolError with a bare "Error executing tool X":
+    agents never saw "Console reserved by ...", "unreachable", "protected path"..."""
+    import asyncio
+
+    names = [t.name for t in asyncio.run(server.mcp.list_tools())]
+    assert names and all(hasattr(getattr(server, n), "__wrapped__") for n in names), "a tool skips @tool()"
+
+    other = ConsoleLock("127.0.0.1", owner="other session")
+    other.acquire("their test")
+    try:
+        with pytest.raises(ToolError) as e:
+            _mcp_call(server, "xbox_mkdir", {"path": "Hdd:/Devkit/x"})
+        assert not isinstance(e.value, UnexpectedToolError)
+        assert "Console reserved by other session (their test)" in str(e.value)
+    finally:
+        other.release()
+    with pytest.raises(ToolError) as e:
+        _mcp_call(server, "xbox_read_memory", {"address": "zz"})
+    assert not isinstance(e.value, UnexpectedToolError) and "ValueError" in str(e.value)
+    with pytest.raises(ToolError, match="Not found: Hdd:/nope.bin"):
+        _mcp_call(server, "xbox_download", {"remote_path": "Hdd:/nope.bin", "local_path": "x"})
+
+
+def test_launch_fails_when_console_is_unreachable(server, monkeypatch):
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    dead_port = s.getsockname()[1]
+    s.close()
+    x = XboxConsole("127.0.0.1", dead_port, timeout=1)
+    with pytest.raises(XbdmConnectionError):
+        x.launch("Hdd:/Apps/demo/default.xex")  # used to return as if it had launched
+    monkeypatch.setattr(server, "xbox", x)
+    with pytest.raises(ToolError, match="Console unreachable"):
+        server.xbox_launch("Hdd:/Apps/demo/default.xex")
+    server.xbox_unlock()
+
+
+def test_debugger_is_off_unless_asked(server):
+    assert not server.notifier.attach_debugger
+    mock_xbdm.CONSOLE.debugger = True  # left attached by an older server or an XDK tool
+    assert server.xbox_lock("test")["debugger"] == "detached"
+    assert mock_xbdm.CONSOLE.debugger is False
+    assert server.xbox_debugger("attach") == {"attached": True}
+    assert mock_xbdm.CONSOLE.debugger is True
+    assert server.xbox_unlock() == "console released, debugger detached"
+    assert mock_xbdm.CONSOLE.debugger is False
+    assert server.xbox_debugger("status")["attached"] is False
+
+
+BS = chr(92)  # backslash, for the mock console's internal keys
+
+
+def test_download_streams_to_disk(xbox, tmp_path):
+    big = bytes(range(256)) * 12000  # ~3 MB
+    xbox.upload("Hdd:/Devkit/big.bin", big)
+    out = tmp_path / "big.bin"
+    assert xbox.download_to("Hdd:/Devkit/big.bin", out, chunk=4096) == len(big)
+    assert out.read_bytes() == big and not (tmp_path / "big.bin.part").exists()
+    with pytest.raises(XbdmError):
+        xbox.download_to("Hdd:/Devkit/nope.bin", tmp_path / "nope.bin")
+    assert not (tmp_path / "nope.bin").exists() and not (tmp_path / "nope.bin.part").exists()
+    xbox.delete("Hdd:/Devkit/big.bin")
+
+
+def test_file_held_open_by_the_title(xbox, server, tmp_path):
+    key = "hdd:" + BS + "log.txt"
+    mock_xbdm.CONSOLE.open_by_title.add(key)
+    try:
+        with pytest.raises(XbdmError, match="running title has this file open"):
+            xbox.download("Hdd:/log.txt")
+        with pytest.raises(ToolError, match="running title has this file open"):
+            server.xbox_read_text_file("Hdd:/log.txt")
+        # a folder download copies the rest and reports the file that failed
+        res = server.xbox_download("Hdd:/", str(tmp_path / "hdd"))
+        assert any(f.startswith("log.txt: ") for f in res["failed"]) and res["downloaded"] > 0
+    finally:
+        mock_xbdm.CONSOLE.open_by_title.discard(key)
+
+
+def test_upload_retried_after_a_dropped_connection(xbox, tmp_path):
+    src = tmp_path / "a.bin"
+    src.write_bytes(b"x" * 200000)
+    mock_xbdm.CONSOLE.drop_next_sendfile = True
+    assert xbox.upload_file("Hdd:/Devkit/a.bin", src) == 200000
+    assert xbox.download("Hdd:/Devkit/a.bin") == b"x" * 200000
+    xbox.delete("Hdd:/Devkit/a.bin")
+
+
+def test_outputs_stay_small_for_claude(server):
+    res = server.xbox_list_dir("Hdd:/", contains="TXT")
+    assert len(res["entries"]) == 1 and res["entries"][0].endswith("  log.txt")
+    res = server.xbox_list_dir("Hdd:/", recursive=True, max_entries=2)
+    assert len(res["entries"]) == 2 and "truncated" in res
+    assert server.xbox_read_text_file("Hdd:/log.txt", grep="line[23]").endswith("line2" + chr(10) + "line3")
+    lines = server._fit_lines([f"line {i} " + "x" * 90 for i in range(2000)])
+    assert sum(len(l) for l in lines) < server.MAX_TEXT + 200 and lines[0].startswith("[... ") and lines[-1].startswith("line 1999")
+    assert server._fit("a" * 100 + chr(10) + "b" * 100, 150).endswith("more characters cut]")
+
+
+def test_ffmpeg_dies_with_the_server(tmp_path):
+    """An orphaned ffmpeg kept the capture card blocked after Claude Code crashed."""
+    import subprocess
+    import sys
+
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import sys, time\n"
+        "from xbox360_mcp.capture import CaptureCard\n"
+        "c = CaptureCard(source=['-re', '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=30'], out_dir=sys.argv[1])\n"
+        "c.start_recording(max_seconds=120, audio=False)\n"
+        "print(c.recording.proc.pid, flush=True)\n"
+        "time.sleep(120)\n",
+        "utf-8",
+    )
+    proc = subprocess.Popen([sys.executable, str(child), str(tmp_path / "cap")], stdout=subprocess.PIPE, text=True)
+    ffmpeg_pid = int(proc.stdout.readline())
+    assert capture_pid_alive(ffmpeg_pid)
+    proc.kill()  # like a crash: no atexit, no clean stop
+    proc.wait()
+    deadline = time.time() + 5
+    while capture_pid_alive(ffmpeg_pid) and time.time() < deadline:
+        time.sleep(0.1)
+    assert not capture_pid_alive(ffmpeg_pid)
+
+
+def capture_pid_alive(pid):
+    from xbox360_mcp.lock import pid_alive
+
+    return pid_alive(pid)
+
+
+def test_title_matches():
+    from xbox360_mcp.protocol import title_matches
+
+    running = BS.join(["", "Device", "Harddisk0", "Partition1", "Emulators", "HarissaDS", "default.xex"])
+    assert title_matches(running, "Hdd:/Emulators/HarissaDS/default.xex")
+    assert not title_matches(running, "Hdd:/Emulators/HarissaPS2/default.xex")
+    assert not title_matches(None, "Hdd:/x/default.xex")
+
+
+def test_launch_log_starts_at_the_new_title(server):
+    res = server.xbox_launch("Hdd:/Apps/demo/default.xex", wait_for="init ok", timeout_seconds=10)
+    assert res["wait_for"]["matched"] and res["skipped_teardown_lines"] >= 30
+    assert not any("terminate thread" in l for l in res["log"]) and "modload" in res["log"][0]
+    # Aurora's own modunload, printed before the title loads, must not satisfy wait_for
+    res = server.xbox_launch("Hdd:/Apps/demo/default.xex", wait_for="modunload", timeout_seconds=3)
+    assert res["wait_for"]["timed_out"]
+    server.xbox_unlock()
+
+
+def test_launch_waits_for_the_title_to_exit(server):
+    import threading
+
+    aurora = BS.join(["", "Device", "Harddisk0", "Partition1", "Apps", "Aurora", "Aurora.xex"])
+
+    def title_quits():
+        time.sleep(3)
+        mock_xbdm.CONSOLE.running = aurora
+
+    threading.Thread(target=title_quits, daemon=True).start()
+    res = server.xbox_launch("Hdd:/Apps/demo/default.xex", wait_exit_seconds=20)
+    assert res["exit"]["exited"] and res["exit"]["seen_running"] and "Aurora" in res["exit"]["now_running"]
+    res = server.xbox_launch("Hdd:/Apps/demo/default.xex", wait_exit_seconds=3)
+    assert res["exit"]["exited"] is False  # still running when the wait ends
+    server.xbox_unlock()
+
+
+def test_rename_overwrite(xbox):
+    xbox.upload("Hdd:/Devkit/new.xex", b"new")
+    xbox.upload("Hdd:/Devkit/old.bak", b"old")
+    with pytest.raises(XbdmError, match="already exists"):
+        xbox.rename("Hdd:/Devkit/new.xex", "Hdd:/Devkit/old.bak")
+    assert xbox.rename("Hdd:/Devkit/new.xex", "Hdd:/Devkit/old.bak", overwrite=True) is True
+    assert xbox.download("Hdd:/Devkit/old.bak") == b"new" and not xbox.exists("Hdd:/Devkit/new.xex")
+    xbox.upload("Hdd:/Devkit/x.bin", b"x")
+    with pytest.raises(XbdmError, match="is a folder"):
+        xbox.rename("Hdd:/Devkit/x.bin", "Hdd:/Apps", overwrite=True)
+    for f in ("old.bak", "x.bin"):
+        xbox.delete("Hdd:/Devkit/" + f)
+
+
+def test_lock_lease_wait_and_renewal(server):
+    import json
+
+    info = server.xbox_lock("long scripted run", lease_seconds=1800)
+    assert info["held_by_me"] and info["expires_in_s"] > 1700
+    # every xbox_* call renews the lease, lock_status included
+    path = server.console_lock.path
+    d = json.loads(path.read_text("utf-8"))
+    d["expires_at"] = time.time() + 5
+    path.write_text(json.dumps(d), "utf-8")
+    assert server.xbox_lock_status()["expires_in_s"] > 1700
+    server.xbox_unlock()
+    assert server.console_lock.lease_seconds == server.cfg.lock_lease
+
+    other = ConsoleLock("127.0.0.1", owner="other session")
+    other.acquire("their test")
+    t = time.time()
+    with pytest.raises(ToolError) as e:
+        server.xbox_lock("mine", wait_seconds=1)
+    assert time.time() - t < 5
+    assert "Still busy after waiting 1 s" in str(e.value) and "other session (their test)" in str(e.value)
+    assert server.MAX_LOCK_WAIT < 120
+    other.release()
+
+
+def test_cli_lock_status_expect(port, lock_dir, capsys):
+    from xbox360_mcp import cli
+
+    assert cli.main(["--host", "127.0.0.1", "lock-status", "--expect", "Harissa64"]) == 5
+    other = ConsoleLock("127.0.0.1", owner="Harissa64")
+    other.acquire("regression run")
+    assert cli.main(["--host", "127.0.0.1", "lock-status", "--expect", "harissa64"]) == 0
+    assert cli.main(["--host", "127.0.0.1", "lock-status", "--expect", "CubeX"]) == 5
+    other.release()
+
+
+def test_screenshot_says_which_title_runs(server):
+    _, meta = server.xbox_screenshot(max_width=320)
+    assert "running_title" in meta
