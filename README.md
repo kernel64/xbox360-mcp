@@ -184,7 +184,8 @@ starts it if needed, keeps it running until `xbox360 capture stop`, and prints t
 a **Media Source**, uncheck "Local File", and put `http://127.0.0.1:8360/xbox.ts` as the input with
 `mpegts` as the input format. VLC opens the same address (Media > Open Network Stream), and
 `http://127.0.0.1:8360/` shows the picture in a browser. Open and close them as you like, the agents
-don't notice. Just don't add the card itself ("USB Video") as a source in OBS: that grabs it for OBS
+don't notice. On Windows, `scripts\watch-vlc.bat` does all of it: it starts the stream, opens it in
+VLC with a short buffer, and lets the stream stop by itself once VLC is closed. Just don't add the card itself ("USB Video") as a source in OBS: that grabs it for OBS
 alone.
 
 The stream is H.264 + AAC, encoded on the GPU (NVENC) when there is one, with a keyframe every second.
